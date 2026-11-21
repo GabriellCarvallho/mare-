@@ -1,0 +1,17 @@
+# binários e saídas do Go
+/maredump
+/broker-bin
+*.exe
+*.test
+*.out
+coverage.*
+# corpus gerado pelo fuzzing (go test -fuzz)
+protocol/testdata/fuzz/
+# dados locais do broker e da fila
+/data/
+*.wal
+*.queue
+# editores
+.vscode/
+.idea/
+.DS_Store
