@@ -1,0 +1,52 @@
+{
+  "_sobre": "Vetores compartilhados do protocolo (contrato Gabriel/Felipe). 'hex' é o quadro completo, com prefixo. Campos omitidos valem zero. Payload em hex.",
+  "valid": [
+    {"name": "PUBLISH exemplo da seção 3.2 (sensor 7, seq 412, 27,10 °C, 28/10/2026 13h UTC)",
+     "hex": "000F010001 00070000019C6AE1F1D00A96",
+     "frame": {"type": 1, "topic_id": 1, "payload": "00070000019C6AE1F1D00A96"}},
+    {"name": "PUBLISH crítico",
+     "hex": "000F010101 00070000019C6AE1F1D00A96",
+     "frame": {"type": 1, "flags": 1, "topic_id": 1, "payload": "00070000019C6AE1F1D00A96"}},
+    {"name": "MESSAGE com delivery_id 42 (21 bytes)",
+     "hex": "0013020001 0000002A 00070000019C6AE1F1D00A96",
+     "frame": {"type": 2, "topic_id": 1, "delivery_id": 42, "payload": "00070000019C6AE1F1D00A96"}},
+    {"name": "PUBLISH_ACK (3 bytes)", "hex": "000103", "frame": {"type": 3}},
+    {"name": "DELIVERY_ACK 42 (7 bytes)", "hex": "0005040000002A", "frame": {"type": 4, "delivery_id": 42}},
+    {"name": "HELLO versão 1, client_id 7", "hex": "000410010007", "frame": {"type": 16, "version": 1, "client_id": 7}},
+    {"name": "STATUS principal, época 3", "hex": "00061101 00000003", "frame": {"type": 17, "role": 1, "epoch": 3}},
+    {"name": "STATUS reserva, época 0", "hex": "00061102 00000000", "frame": {"type": 17, "role": 2}},
+    {"name": "CREATE_TOPIC mar/temp", "hex": "000A2008 6D61722F74656D70", "frame": {"type": 32, "topic_name": "mar/temp"}},
+    {"name": "RESOLVE_TOPIC mar/temp", "hex": "000A2108 6D61722F74656D70", "frame": {"type": 33, "topic_name": "mar/temp"}},
+    {"name": "TOPIC_ID 5", "hex": "00022205", "frame": {"type": 34, "topic_id": 5}},
+    {"name": "DELETE_TOPIC 5", "hex": "00022305", "frame": {"type": 35, "topic_id": 5}},
+    {"name": "SUBSCRIBE 5", "hex": "00022405", "frame": {"type": 36, "topic_id": 5}},
+    {"name": "UNSUBSCRIBE 5", "hex": "00022505", "frame": {"type": 37, "topic_id": 5}},
+    {"name": "OK", "hex": "000126", "frame": {"type": 38}},
+    {"name": "ERROR NO_SUBSCRIBERS", "hex": "00023010", "frame": {"type": 48, "err_code": 16}},
+    {"name": "ERROR RECOVERING", "hex": "00023022", "frame": {"type": 48, "err_code": 34}},
+    {"name": "ERROR NOT_LEADER", "hex": "00023030", "frame": {"type": 48, "err_code": 48}}
+  ],
+  "invalid": [
+    {"name": "corpo de tamanho zero", "hex": "0000"},
+    {"name": "corpo acima de 256 bytes (rejeitado antes de ler o corpo)", "hex": "0101"},
+    {"name": "tipo desconhecido", "hex": "00017F"},
+    {"name": "PUBLISH sem payload", "hex": "0003010001"},
+    {"name": "PUBLISH com flag reservada", "hex": "000F010201 00070000019C6AE1F1D00A96"},
+    {"name": "PUBLISH com topic_id 0", "hex": "000F010000 00070000019C6AE1F1D00A96"},
+    {"name": "MESSAGE sem delivery_id completo", "hex": "00050200010000"},
+    {"name": "PUBLISH_ACK com byte a mais", "hex": "00020300"},
+    {"name": "DELIVERY_ACK curto", "hex": "000404000000"},
+    {"name": "HELLO curto", "hex": "00021001"},
+    {"name": "STATUS com papel inválido", "hex": "000611FF00000001"},
+    {"name": "CREATE_TOPIC com comprimento errado", "hex": "0003200561"},
+    {"name": "CREATE_TOPIC com nome vazio", "hex": "00022000"},
+    {"name": "CREATE_TOPIC com UTF-8 inválido", "hex": "00042002C328"},
+    {"name": "SUBSCRIBE com topic_id 0", "hex": "00022400"},
+    {"name": "TOPIC_ID 0", "hex": "00022200"},
+    {"name": "ERROR com código desconhecido", "hex": "000230EE"}
+  ],
+  "truncated": [
+    {"name": "conexão cai no meio do prefixo", "hex": "00"},
+    {"name": "conexão cai no meio do corpo", "hex": "000F0100010007"}
+  ]
+}
