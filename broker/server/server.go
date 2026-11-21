@@ -10,8 +10,10 @@
 //     `out` e escreve. Assim duas goroutines nunca escrevem ao mesmo tempo
 //     (o contrato de protocol.WriteFrame exige isso).
 //
-// Os próximos passos acrescentam tópicos (4), publicação e entrega (5), log
-// (6) e reserva/promoção (7).
+// Passo 4 (topics.go): comandos de tópicos e assinaturas pela rede.
+//
+// Os próximos passos acrescentam publicação e entrega (5), log (6) e
+// reserva/promoção (7).
 package server
 
 import (
@@ -23,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GabriellCarvallho/mare-pubsub/broker/topics"
 	"github.com/GabriellCarvallho/mare-pubsub/protocol"
 )
 
@@ -51,6 +54,12 @@ type broker struct {
 	role     byte
 	epoch    uint32
 	sessions map[*session]struct{} // conexões abertas
+
+	topics interface {
+		topics.Registry
+		topics.Restorer
+	} // Parte 2
+	removing map[uint8]bool // tópicos EM_REMOÇÃO
 
 	wg sync.WaitGroup // espera as goroutines no encerramento
 }
@@ -86,6 +95,8 @@ func Run(ctx context.Context, cfg Config) error {
 		cfg:      cfg,
 		role:     protocol.RoleReserva,
 		sessions: make(map[*session]struct{}),
+		topics:   topics.New(),
+		removing: make(map[uint8]bool),
 	}
 	if cfg.Role == RolePrincipal {
 		b.role = protocol.RolePrincipal
@@ -222,9 +233,26 @@ func (s *session) handle(f protocol.Frame) protocol.Frame {
 		return errFrame(protocol.CodeHelloRequired)
 	}
 
+	// A reserva não atende nada além do HELLO até ser promovida (Seção 6.1).
+	s.b.mu.Lock()
+	standby := s.b.role != protocol.RolePrincipal
+	s.b.mu.Unlock()
+	if standby {
+		return errFrame(protocol.CodeNotLeader)
+	}
+
 	switch f.Type {
-	// Passo 4: CREATE_TOPIC, RESOLVE_TOPIC, DELETE_TOPIC, SUBSCRIBE, UNSUBSCRIBE
-	// Passo 5: PUBLISH e DELIVERY_ACK
+	case protocol.TypeCreateTopic:
+		return s.b.createTopic(f.TopicName)
+	case protocol.TypeResolveTopic:
+		return s.b.resolveTopic(f.TopicName)
+	case protocol.TypeDeleteTopic:
+		return s.b.deleteTopic(f.TopicID)
+	case protocol.TypeSubscribe:
+		return s.b.subscribe(s, f.TopicID)
+	case protocol.TypeUnsubscribe:
+		return s.b.unsubscribe(s, f.TopicID)
+		// Passo 5: PUBLISH e DELIVERY_ACK
 	}
 
 	// Por enquanto, qualquer outro comando é recusado.
