@@ -85,9 +85,14 @@ func (b *broker) maybePurge(id uint8) {
 	}
 }
 
-// hasPending diz se alguma publicação ainda não terminou de ser entregue
-// neste tópico. Por enquanto não há publicações; o passo 5 preenche isto.
+// hasPending diz se alguma publicação deste tópico ainda está no broker
+// (com entregas pendentes ou em quarentena). Chamar com b.mu travado.
 func (b *broker) hasPending(id uint8) bool {
+	for _, p := range b.pubs {
+		if p.topic == id {
+			return true
+		}
+	}
 	return false
 }
 
@@ -100,6 +105,7 @@ func (b *broker) subscribe(s *session, id uint8) protocol.Frame {
 	if err := b.topics.Subscribe(id, s.clientID); err != nil {
 		return topicError(err)
 	}
+	s.subscriber = true // esta conexão passa a ser a preferida para os MESSAGE
 	return ok
 }
 

@@ -15,18 +15,23 @@ import (
 // O broker é encerrado no fim do teste.
 func startBroker(t *testing.T, role string) string {
 	t.Helper()
+	return startBrokerWith(t, Config{Role: role})
+}
+
+// startBrokerWith faz o mesmo com uma Config escolhida pelo teste.
+func startBrokerWith(t *testing.T, cfg Config) string {
+	t.Helper()
 	addrCh := make(chan string, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 
-	go func() {
-		done <- Run(ctx, Config{
-			Addr:     "127.0.0.1:0",
-			Role:     role,
-			OnListen: func(a net.Addr) { addrCh <- a.String() },
-			Logf:     func(string, ...any) {},
-		})
-	}()
+	cfg.Addr = "127.0.0.1:0"
+	cfg.OnListen = func(a net.Addr) { addrCh <- a.String() }
+	if cfg.Logf == nil {
+		cfg.Logf = func(string, ...any) {}
+	}
+
+	go func() { done <- Run(ctx, cfg) }()
 
 	t.Cleanup(func() {
 		cancel()

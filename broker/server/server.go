@@ -12,8 +12,10 @@
 //
 // Passo 4 (topics.go): comandos de tópicos e assinaturas pela rede.
 //
-// Os próximos passos acrescentam publicação e entrega (5), log (6) e
-// reserva/promoção (7).
+// Passo 5 (publish.go): PUBLISH → escalonador → MESSAGE → DELIVERY_ACK, com
+// duas goroutines de fundo (despachante e relógio de reenvio).
+//
+// Os próximos passos acrescentam o log (6) e a reserva/promoção (7).
 package server
 
 import (
@@ -25,6 +27,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GabriellCarvallho/mare-pubsub/broker/delivery"
+	"github.com/GabriellCarvallho/mare-pubsub/broker/sched"
 	"github.com/GabriellCarvallho/mare-pubsub/broker/topics"
 	"github.com/GabriellCarvallho/mare-pubsub/protocol"
 )
@@ -40,9 +44,12 @@ type Config struct {
 	DataDir  string        // onde ficam o log e a época (usado no passo 6)
 	Recovery time.Duration // janela RECOVERING, 30 s (usado no passo 7)
 
-	// Extensões para testes. Valores zero usam o padrão.
-	OnListen func(net.Addr)                   // recebe o endereço real (útil com ":0")
-	Logf     func(format string, args ...any) // padrão: log.Printf
+	// Extensões. Valores zero usam o padrão.
+	OnListen      func(net.Addr)                   // recebe o endereço real (útil com ":0")
+	Logf          func(format string, args ...any) // padrão: log.Printf
+	Sched         sched.Config                     // cotas (padrão: 1.000 por sensor)
+	RetryInterval time.Duration                    // intervalo do relógio de reenvio (padrão 250 ms)
+	Now           func() time.Time                 // relógio (padrão time.Now; os testes trocam)
 }
 
 // broker guarda o estado compartilhado. Tudo que várias goroutines leem ou
@@ -61,6 +68,14 @@ type broker struct {
 	} // Parte 2
 	removing map[uint8]bool // tópicos EM_REMOÇÃO
 
+	// Passo 5
+	clients map[uint16][]*session   // client_id → conexões abertas (roteamento dos MESSAGE)
+	sched   sched.Scheduler         // Parte 2: ordem 3:1 e cotas
+	dm      *delivery.Manager       // passo 2: estado de cada entrega
+	pubs    map[uint64]*publication // publicações ainda não concluídas
+	nextRef uint64                  // próxima ref de publicação
+	now     func() time.Time
+
 	wg sync.WaitGroup // espera as goroutines no encerramento
 }
 
@@ -72,8 +87,9 @@ type session struct {
 	done       chan struct{}       // fechado quando a leitora termina
 	writerDone chan struct{}       // fechado quando a escritora termina
 
-	hello    bool   // já recebeu HELLO?
-	clientID uint16 // client_id informado no HELLO
+	hello      bool   // já recebeu HELLO?
+	clientID   uint16 // client_id informado no HELLO
+	subscriber bool   // fez SUBSCRIBE nesta conexão: é a preferida para os MESSAGE
 }
 
 // closeAfterWrite é um quadro "sentinela": a escritora fecha a conexão depois
@@ -90,6 +106,12 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Logf == nil {
 		cfg.Logf = log.Printf
 	}
+	if cfg.RetryInterval <= 0 {
+		cfg.RetryInterval = 250 * time.Millisecond
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 
 	b := &broker{
 		cfg:      cfg,
@@ -97,6 +119,12 @@ func Run(ctx context.Context, cfg Config) error {
 		sessions: make(map[*session]struct{}),
 		topics:   topics.New(),
 		removing: make(map[uint8]bool),
+		clients:  make(map[uint16][]*session),
+		sched:    sched.New(cfg.Sched),
+		dm:       delivery.New(),
+		pubs:     make(map[uint64]*publication),
+		nextRef:  1,
+		now:      cfg.Now,
 	}
 	if cfg.Role == RolePrincipal {
 		b.role = protocol.RolePrincipal
@@ -112,8 +140,10 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	cfg.Logf("broker %s ouvindo em %s", cfg.Role, ln.Addr())
 
-	b.wg.Add(1)
+	b.wg.Add(3)
 	go b.acceptLoop(ln)
+	go b.dispatchLoop(ctx) // passo 5: escalonador → entregas
+	go b.retryLoop(ctx)    // passo 5: relógio de reenvio
 
 	<-ctx.Done() // espera o pedido de encerramento
 
@@ -201,7 +231,9 @@ func (s *session) readLoop() {
 			invalid = errors.Is(err, protocol.ErrInvalidFrame)
 			break
 		}
-		s.reply(s.handle(f))
+		if resp, hasReply := s.handle(f); hasReply {
+			s.reply(resp)
+		}
 	}
 
 	if invalid {
@@ -219,18 +251,50 @@ func (s *session) readLoop() {
 	s.conn.Close()
 	<-s.writerDone
 
-	s.b.mu.Lock()
-	delete(s.b.sessions, s)
-	s.b.mu.Unlock()
+	s.b.unregister(s)
 }
 
-// handle decide a resposta de cada pedido.
-func (s *session) handle(f protocol.Frame) protocol.Frame {
+// unregister tira a conexão dos mapas. As entregas em voo do cliente voltam
+// a aguardar, sem contar falha (Seção 4.2): se ele tiver outra conexão
+// aberta (ou reconectar), elas são reenviadas por ela.
+func (b *broker) unregister(s *session) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	delete(b.sessions, s)
+	if !s.hello {
+		return
+	}
+	list := b.clients[s.clientID]
+	for i, x := range list {
+		if x == s {
+			list = append(list[:i], list[i+1:]...)
+			break
+		}
+	}
+	if len(list) == 0 {
+		delete(b.clients, s.clientID)
+	} else {
+		b.clients[s.clientID] = list
+	}
+
+	// O que foi enviado por esta conexão pode não ter chegado. Mesmo que o
+	// cliente tenha outra conexão aberta, devolvemos tudo a AGUARDANDO; no
+	// pior caso, ele recebe uma repetição (permitido pelo "pelo menos uma vez").
+	b.dm.Disconnected(s.clientID)
+	if len(list) > 0 {
+		b.kick() // reenvia já pela outra conexão
+	}
+}
+
+// handle decide a resposta de cada pedido. hasReply é false para o
+// DELIVERY_ACK, que não tem resposta no protocolo.
+func (s *session) handle(f protocol.Frame) (resp protocol.Frame, hasReply bool) {
 	if f.Type == protocol.TypeHello {
 		return s.handleHello(f)
 	}
 	if !s.hello {
-		return errFrame(protocol.CodeHelloRequired)
+		return errFrame(protocol.CodeHelloRequired), true
 	}
 
 	// A reserva não atende nada além do HELLO até ser promovida (Seção 6.1).
@@ -238,35 +302,56 @@ func (s *session) handle(f protocol.Frame) protocol.Frame {
 	standby := s.b.role != protocol.RolePrincipal
 	s.b.mu.Unlock()
 	if standby {
-		return errFrame(protocol.CodeNotLeader)
+		if f.Type == protocol.TypeDeliveryAck {
+			return protocol.Frame{}, false
+		}
+		return errFrame(protocol.CodeNotLeader), true
 	}
 
 	switch f.Type {
 	case protocol.TypeCreateTopic:
-		return s.b.createTopic(f.TopicName)
+		return s.b.createTopic(f.TopicName), true
 	case protocol.TypeResolveTopic:
-		return s.b.resolveTopic(f.TopicName)
+		return s.b.resolveTopic(f.TopicName), true
 	case protocol.TypeDeleteTopic:
-		return s.b.deleteTopic(f.TopicID)
+		return s.b.deleteTopic(f.TopicID), true
 	case protocol.TypeSubscribe:
-		return s.b.subscribe(s, f.TopicID)
+		return s.b.subscribe(s, f.TopicID), true
 	case protocol.TypeUnsubscribe:
-		return s.b.unsubscribe(s, f.TopicID)
-		// Passo 5: PUBLISH e DELIVERY_ACK
+		return s.b.unsubscribe(s, f.TopicID), true
+	case protocol.TypePublish:
+		return s.b.publish(s, f), true
+	case protocol.TypeDeliveryAck:
+		s.b.ack(s, f.DeliveryID)
+		return protocol.Frame{}, false
 	}
 
-	// Por enquanto, qualquer outro comando é recusado.
-	return errFrame(protocol.CodeInvalidMessage)
+	// Tipos que só o broker envia (MESSAGE, STATUS, OK...) não são pedidos.
+	return errFrame(protocol.CodeInvalidMessage), true
 }
 
-func (s *session) handleHello(f protocol.Frame) protocol.Frame {
+// handleHello registra o cliente e responde STATUS. O STATUS é enfileirado
+// ainda com b.mu travado: assim nenhum MESSAGE para este cliente (do
+// despachante ou do relógio) passa na frente dele.
+func (s *session) handleHello(f protocol.Frame) (protocol.Frame, bool) {
 	if f.Version != protocol.Version {
-		return errFrame(protocol.CodeUnsupportedVersion)
+		return errFrame(protocol.CodeUnsupportedVersion), true
 	}
-	s.hello = true
-	s.clientID = f.ClientID
 
-	s.b.mu.Lock()
-	defer s.b.mu.Unlock()
-	return protocol.Frame{Type: protocol.TypeStatus, Role: s.b.role, Epoch: s.b.epoch}
+	b := s.b
+	b.mu.Lock()
+	if !s.hello {
+		s.hello = true
+		s.clientID = f.ClientID
+		b.clients[s.clientID] = append(b.clients[s.clientID], s)
+	}
+	status := protocol.Frame{Type: protocol.TypeStatus, Role: b.role, Epoch: b.epoch}
+	sent := s.trySend(status)
+	b.mu.Unlock()
+
+	if !sent {
+		s.reply(status) // fila cheia (raro): espera vaga
+	}
+	b.kick() // se o cliente voltou, recebe já o que estava pendente
+	return protocol.Frame{}, false
 }
