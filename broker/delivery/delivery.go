@@ -108,6 +108,16 @@ func (m *Manager) MarkSent(id uint32, now time.Time) {
 	e.deadline = now.Add(Timeout(e.Failures))
 }
 
+// Lookup devolve uma entrega ainda pendente pelo ID (usado pelo servidor
+// para gravar o DELIVERED no log antes de confirmar).
+func (m *Manager) Lookup(id uint32) (Delivery, bool) {
+	e, ok := m.byID[id]
+	if !ok {
+		return Delivery{}, false
+	}
+	return e.Delivery, true
+}
+
 // Ack confirma a entrega se o ID e o cliente forem correspondentes.
 // ACK repetido, atrasado ou de outro cliente devolve ok=false.
 func (m *Manager) Ack(id uint32, client uint16) (ref uint64, ok bool) {

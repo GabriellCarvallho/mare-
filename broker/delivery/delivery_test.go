@@ -153,3 +153,17 @@ func TestDisconnectedNaoMexeEmOutrosClientes(t *testing.T) {
 		t.Fatalf("esperado reenviar só a do cliente 10: %+v", send)
 	}
 }
+
+func TestLookup(t *testing.T) {
+	m := New()
+	d := m.Add(5, []uint16{10})[0]
+
+	got, ok := m.Lookup(d.ID)
+	if !ok || got.Ref != 5 || got.Client != 10 {
+		t.Fatalf("Lookup: %+v %v", got, ok)
+	}
+	m.Ack(d.ID, 10)
+	if _, ok := m.Lookup(d.ID); ok {
+		t.Fatal("entrega confirmada não deveria ser encontrada")
+	}
+}

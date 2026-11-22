@@ -15,7 +15,10 @@
 // Passo 5 (publish.go): PUBLISH → escalonador → MESSAGE → DELIVERY_ACK, com
 // duas goroutines de fundo (despachante e relógio de reenvio).
 //
-// Os próximos passos acrescentam o log (6) e a reserva/promoção (7).
+// Passo 6 (log.go, persist.go): grava tudo no log antes de confirmar e
+// reconstrói o estado ao reiniciar.
+//
+// O próximo passo acrescenta a reserva e a promoção (7).
 package server
 
 import (
@@ -28,6 +31,7 @@ import (
 	"time"
 
 	"github.com/GabriellCarvallho/mare-pubsub/broker/delivery"
+	"github.com/GabriellCarvallho/mare-pubsub/broker/logrec"
 	"github.com/GabriellCarvallho/mare-pubsub/broker/sched"
 	"github.com/GabriellCarvallho/mare-pubsub/broker/topics"
 	"github.com/GabriellCarvallho/mare-pubsub/protocol"
@@ -41,7 +45,7 @@ const (
 type Config struct {
 	Addr     string        // ex.: ":7000"
 	Role     string        // "principal" ou "reserva"
-	DataDir  string        // onde ficam o log e a época (usado no passo 6)
+	DataDir  string        // onde ficam o log e a época
 	Recovery time.Duration // janela RECOVERING, 30 s (usado no passo 7)
 
 	// Extensões. Valores zero usam o padrão.
@@ -50,6 +54,8 @@ type Config struct {
 	Sched         sched.Config                     // cotas (padrão: 1.000 por sensor)
 	RetryInterval time.Duration                    // intervalo do relógio de reenvio (padrão 250 ms)
 	Now           func() time.Time                 // relógio (padrão time.Now; os testes trocam)
+	OpenLog       func(path string) (Log, error)   // abre o log (padrão: em memória, sem persistência)
+	CompactEvery  int                              // compacta a cada N publicações concluídas (padrão 1.000)
 }
 
 // broker guarda o estado compartilhado. Tudo que várias goroutines leem ou
@@ -75,6 +81,12 @@ type broker struct {
 	pubs    map[uint64]*publication // publicações ainda não concluídas
 	nextRef uint64                  // próxima ref de publicação
 	now     func() time.Time
+
+	// Passo 6
+	log        Log        // log da época atual
+	logRecords int        // registros lidos na reconstrução (0 = log novo)
+	completed  int        // publicações concluídas desde a última compactação
+	fatal      chan error // erro que encerra o broker (log quebrado)
 
 	wg sync.WaitGroup // espera as goroutines no encerramento
 }
@@ -112,6 +124,13 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.OpenLog == nil {
+		// Sem o wal do Felipe: log em memória, novo a cada execução.
+		cfg.OpenLog = NewMemoryStore(0).Open
+	}
+	if cfg.CompactEvery <= 0 {
+		cfg.CompactEvery = 1000
+	}
 
 	b := &broker{
 		cfg:      cfg,
@@ -125,14 +144,27 @@ func Run(ctx context.Context, cfg Config) error {
 		pubs:     make(map[uint64]*publication),
 		nextRef:  1,
 		now:      cfg.Now,
+		fatal:    make(chan error, 1),
 	}
 	if cfg.Role == RolePrincipal {
 		b.role = protocol.RolePrincipal
 		b.epoch = 1 // provisório: o passo 7 cuida da época de verdade
+
+		// Passo 6: relê o log ANTES de aceitar conexões.
+		if err := b.openLog(); err != nil {
+			return err
+		}
+		if b.logRecords == 0 { // log novo: registra a época
+			if err := b.appendRec(logrec.Record{Kind: logrec.KindEpoch, Epoch: b.epoch}); err != nil {
+				b.log.Close()
+				return err
+			}
+		}
 	}
 
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
+		b.closeLog()
 		return err
 	}
 	if cfg.OnListen != nil {
@@ -140,21 +172,41 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	cfg.Logf("broker %s ouvindo em %s", cfg.Role, ln.Addr())
 
+	loopCtx, stopLoops := context.WithCancel(ctx)
+	defer stopLoops()
+
 	b.wg.Add(3)
 	go b.acceptLoop(ln)
-	go b.dispatchLoop(ctx) // passo 5: escalonador → entregas
-	go b.retryLoop(ctx)    // passo 5: relógio de reenvio
+	go b.dispatchLoop(loopCtx) // passo 5: escalonador → entregas
+	go b.retryLoop(loopCtx)    // passo 5: relógio de reenvio
 
-	<-ctx.Done() // espera o pedido de encerramento
+	// Espera o pedido de encerramento ou um erro fatal (log quebrado).
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-b.fatal:
+		cfg.Logf("erro fatal: %v", runErr)
+	}
 
-	ln.Close() // acceptLoop sai
+	stopLoops() // despachante e relógio saem
+	ln.Close()  // acceptLoop sai
 	b.mu.Lock()
 	for s := range b.sessions {
 		s.conn.Close() // as leitoras saem com erro de leitura
 	}
 	b.mu.Unlock()
 	b.wg.Wait()
-	return nil
+	b.closeLog() // o que foi confirmado continua no log
+	return runErr
+}
+
+func (b *broker) closeLog() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.log != nil {
+		b.log.Close()
+		b.log = nil
+	}
 }
 
 func (b *broker) acceptLoop(ln net.Listener) {

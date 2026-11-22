@@ -16,12 +16,16 @@ package server
 //	                                                              a publicação, Purge
 //
 // Todo o estado (pubs, sched, dm, clients) fica sob b.mu.
+//
+// Passo 6: PUBLISHED é gravado antes do PUBLISH_ACK; DELIVERED antes de
+// dar a entrega por confirmada; QUARANTINED quando a entrega desiste.
 
 import (
 	"context"
 	"time"
 
 	"github.com/GabriellCarvallho/mare-pubsub/broker/delivery"
+	"github.com/GabriellCarvallho/mare-pubsub/broker/logrec"
 	"github.com/GabriellCarvallho/mare-pubsub/broker/sched"
 	"github.com/GabriellCarvallho/mare-pubsub/protocol"
 )
@@ -43,8 +47,11 @@ type publication struct {
 // ---------------------------------------------------------------------------
 // PUBLISH (5.2)
 
-// publish: snapshot → ref → escalonador → PUBLISH_ACK.
-// No passo 6, o PUBLISH_ACK só sai depois de gravar no log.
+// publish: snapshot → ref → escalonador → grava no log → PUBLISH_ACK.
+//
+// O mutex fica travado durante a gravação. É a forma mais simples de manter
+// memória e log na mesma ordem; o custo é que um fsync lento atrasa os
+// outros clientes nesse intervalo (trade-off aceito no protótipo).
 func (b *broker) publish(s *session, f protocol.Frame) protocol.Frame {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -63,7 +70,7 @@ func (b *broker) publish(s *session, f protocol.Frame) protocol.Frame {
 	}
 	b.nextRef++
 
-	b.pubs[ref] = &publication{
+	p := &publication{
 		ref:        ref,
 		topic:      f.TopicID,
 		flags:      f.Flags,
@@ -72,6 +79,19 @@ func (b *broker) publish(s *session, f protocol.Frame) protocol.Frame {
 		recipients: recipients,
 		item:       item,
 	}
+
+	// Durável antes de confirmar (Seção 5.1). Se falhar, a leitura não é
+	// aceita: o sensor a mantém na fila local e tenta de novo depois.
+	err = b.appendRec(logrec.Record{
+		Kind: logrec.KindPublished, Ref: ref, TopicID: p.topic, Flags: p.flags,
+		Publisher: p.publisher, Recipients: p.recipients, Payload: p.payload,
+	})
+	if err != nil {
+		b.sched.Done(item) // libera a cota; o despachante ignora a ref sem publicação
+		return storageUnavailable
+	}
+
+	b.pubs[ref] = p
 	return protocol.Frame{Type: protocol.TypePublishAck}
 }
 
@@ -168,6 +188,15 @@ func (b *broker) ack(s *session, id uint32) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	d, found := b.dm.Lookup(id)
+	if !found || d.Client != s.clientID {
+		return
+	}
+	// Sem o DELIVERED no log, a entrega não conta como confirmada: depois
+	// de uma queda ela seria reenviada (o que é permitido).
+	if err := b.appendRec(logrec.Record{Kind: logrec.KindDelivered, Ref: d.Ref, Client: d.Client}); err != nil {
+		return
+	}
 	if ref, ok := b.dm.Ack(id, s.clientID); ok {
 		b.afterChange(ref)
 	}
@@ -189,6 +218,7 @@ func (b *broker) afterChange(ref uint64) {
 	}
 	delete(b.pubs, ref) // concluída
 	b.maybePurge(p.topic)
+	b.maybeCompact()
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +266,7 @@ func (b *broker) tick() {
 	for _, d := range quarantined {
 		b.cfg.Logf("entrega %d (ref %d, cliente %d) em quarentena após %d falhas",
 			d.ID, d.Ref, d.Client, d.Failures)
+		b.appendRec(logrec.Record{Kind: logrec.KindQuarantined, Ref: d.Ref, Client: d.Client})
 		if p := b.pubs[d.Ref]; p != nil {
 			p.quarantined++
 		}
