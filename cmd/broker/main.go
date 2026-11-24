@@ -9,9 +9,9 @@
 // Ctrl+C encerra com limpeza: para de aceitar conexões, fecha as abertas e
 // fecha o log. O que foi confirmado continua no log.
 //
-// Por enquanto o log fica em memória (server.MemoryStore): ele se perde ao
-// encerrar o processo. Quando o wal do Felipe ficar pronto, basta trocar o
-// OpenLog em newConfig pelo adaptador do wal.
+// O log fica em disco, no wal do Felipe (adaptador em wal.go): um arquivo
+// por época em DATA/log-<época>.wal. Reiniciar com a mesma pasta recupera
+// tópicos, assinaturas e entregas pendentes.
 package main
 
 import (
@@ -87,9 +87,7 @@ func newConfig(o options, stdout io.Writer) server.Config {
 		Logf: func(format string, args ...any) {
 			fmt.Fprintf(stdout, time.Now().Format("15:04:05 ")+format+"\n", args...)
 		},
-		// TODO(integração com o Felipe): trocar pelo adaptador do wal:
-		//   OpenLog: func(path string) (server.Log, error) { ... wal.Open(path, 512<<20) ... }
-		OpenLog: server.NewMemoryStore(512 << 20).Open,
+		OpenLog: openWAL, // wal.go: log em disco (wal do Felipe)
 	}
 }
 
@@ -114,7 +112,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}
 
 	cfg := newConfig(o, stdout)
-	cfg.Logf("iniciando %s (dados em %s); log em memória até integrar o wal", o.role, o.dataDir)
+	cfg.Logf("iniciando %s (dados em %s)", o.role, o.dataDir)
 	if err := server.Run(ctx, cfg); err != nil {
 		return err
 	}
