@@ -18,7 +18,8 @@
 // Passo 6 (log.go, persist.go): grava tudo no log antes de confirmar e
 // reconstrói o estado ao reiniciar.
 //
-// O próximo passo acrescenta a reserva e a promoção (7).
+// Passo 7 (promote.go): época gravada no disco, PROMOTE da reserva e janela
+// RECOVERING.
 package server
 
 import (
@@ -46,7 +47,7 @@ type Config struct {
 	Addr     string        // ex.: ":7000"
 	Role     string        // "principal" ou "reserva"
 	DataDir  string        // onde ficam o log e a época
-	Recovery time.Duration // janela RECOVERING, 30 s (usado no passo 7)
+	Recovery time.Duration // janela RECOVERING após a promoção (padrão 30 s; negativo = sem janela)
 
 	// Extensões. Valores zero usam o padrão.
 	OnListen      func(net.Addr)                   // recebe o endereço real (útil com ":0")
@@ -87,6 +88,9 @@ type broker struct {
 	logRecords int        // registros lidos na reconstrução (0 = log novo)
 	completed  int        // publicações concluídas desde a última compactação
 	fatal      chan error // erro que encerra o broker (log quebrado)
+
+	// Passo 7
+	recoveringUntil time.Time // até quando PUBLISH recebe RECOVERING
 
 	wg sync.WaitGroup // espera as goroutines no encerramento
 }
@@ -131,6 +135,11 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.CompactEvery <= 0 {
 		cfg.CompactEvery = 1000
 	}
+	if cfg.Recovery == 0 {
+		cfg.Recovery = DefaultRecovery
+	} else if cfg.Recovery < 0 {
+		cfg.Recovery = 0
+	}
 
 	b := &broker{
 		cfg:      cfg,
@@ -148,9 +157,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	if cfg.Role == RolePrincipal {
 		b.role = protocol.RolePrincipal
-		b.epoch = 1 // provisório: o passo 7 cuida da época de verdade
+	}
 
-		// Passo 6: relê o log ANTES de aceitar conexões.
+	// Passo 7: a época vem do disco (DataDir/epoch).
+	if err := b.loadEpoch(); err != nil {
+		return err
+	}
+
+	if cfg.Role == RolePrincipal {
+		// Passo 6: relê o log da época ANTES de aceitar conexões.
 		if err := b.openLog(); err != nil {
 			return err
 		}
@@ -349,15 +364,26 @@ func (s *session) handle(f protocol.Frame) (resp protocol.Frame, hasReply bool) 
 		return errFrame(protocol.CodeHelloRequired), true
 	}
 
-	// A reserva não atende nada além do HELLO até ser promovida (Seção 6.1).
+	// Passo 7: o operador promove a reserva.
+	if f.Type == protocol.TypePromote {
+		return s.b.promote(), true
+	}
+
+	// A reserva não atende nada além do HELLO e do PROMOTE até ser
+	// promovida (Seção 6.1). Logo depois da promoção, PUBLISH recebe
+	// RECOVERING enquanto os clientes refazem tópicos e assinaturas (6.2).
 	s.b.mu.Lock()
 	standby := s.b.role != protocol.RolePrincipal
+	recovering := s.b.recovering()
 	s.b.mu.Unlock()
 	if standby {
 		if f.Type == protocol.TypeDeliveryAck {
 			return protocol.Frame{}, false
 		}
 		return errFrame(protocol.CodeNotLeader), true
+	}
+	if recovering && f.Type == protocol.TypePublish {
+		return errFrame(protocol.CodeRecovering), true
 	}
 
 	switch f.Type {

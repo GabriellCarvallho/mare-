@@ -235,7 +235,8 @@ func TestCompactacao(t *testing.T) {
 
 	// Sobram EPOCH, TOPIC_CREATED e SUBSCRIBED; os 3 PUBLISHED e os 3
 	// DELIVERED foram removidos.
-	if n := store.Len(logPath(cfg.DataDir, 1)); n != 3 {
+	epoch, _, _ := readEpoch(cfg.DataDir) // passo 7: a época vem do disco
+	if n := store.Len(logPath(cfg.DataDir, epoch)); n != 3 {
 		t.Fatalf("log com %d registros depois da compactação, esperado 3", n)
 	}
 }

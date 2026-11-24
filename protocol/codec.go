@@ -55,7 +55,7 @@ func appendBody(b []byte, f Frame) ([]byte, error) {
 		}
 		return append(b, f.Payload...), nil
 
-	case TypePublishAck, TypeOK:
+	case TypePublishAck, TypeOK, TypePromote:
 		return append(b, f.Type), nil
 
 	case TypeDeliveryAck:
@@ -141,7 +141,7 @@ func checkData(f Frame) error {
 
 // bodySize é o tamanho exato do corpo dos comandos de tamanho fixo.
 var bodySize = map[byte]int{
-	TypePublishAck: 1, TypeOK: 1,
+	TypePublishAck: 1, TypeOK: 1, TypePromote: 1,
 	TypeDeliveryAck: 5,
 	TypeHello:       4,
 	TypeStatus:      6,
@@ -186,7 +186,7 @@ func decode(b []byte) (Frame, error) {
 		f.Payload = b[hdr:]
 		return f, checkData(f)
 
-	case TypePublishAck, TypeOK:
+	case TypePublishAck, TypeOK, TypePromote:
 		return f, nil
 
 	case TypeDeliveryAck:

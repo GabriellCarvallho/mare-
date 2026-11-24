@@ -41,8 +41,9 @@ const (
 	TypePublishAck  byte = 0x03 // só o tipo; confirma pela ordem dos pedidos
 	TypeDeliveryAck byte = 0x04 // delivery_id
 
-	TypeHello  byte = 0x10 // versão, client_id
-	TypeStatus byte = 0x11 // papel, época
+	TypeHello   byte = 0x10 // versão, client_id
+	TypeStatus  byte = 0x11 // papel, época
+	TypePromote byte = 0x12 // só o tipo; operador → reserva (resposta: STATUS ou ERROR)
 
 	TypeCreateTopic  byte = 0x20 // nome
 	TypeResolveTopic byte = 0x21 // nome
@@ -84,7 +85,8 @@ const (
 	CodeStorageUnavailable byte = 0x21
 	CodeRecovering         byte = 0x22
 	// Liderança: procurar o principal válido.
-	CodeNotLeader byte = 0x30
+	CodeNotLeader        byte = 0x30
+	CodeAlreadyPrincipal byte = 0x31 // PROMOTE enviado a quem já é principal
 )
 
 // Frame representa qualquer quadro. Cada tipo usa só alguns campos; os
@@ -109,7 +111,7 @@ func (f Frame) Critical() bool { return f.Flags&FlagCritical != 0 }
 var typeNames = map[byte]string{
 	TypePublish: "PUBLISH", TypeMessage: "MESSAGE",
 	TypePublishAck: "PUBLISH_ACK", TypeDeliveryAck: "DELIVERY_ACK",
-	TypeHello: "HELLO", TypeStatus: "STATUS",
+	TypeHello: "HELLO", TypeStatus: "STATUS", TypePromote: "PROMOTE",
 	TypeCreateTopic: "CREATE_TOPIC", TypeResolveTopic: "RESOLVE_TOPIC",
 	TypeTopicID: "TOPIC_ID", TypeDeleteTopic: "DELETE_TOPIC",
 	TypeSubscribe: "SUBSCRIBE", TypeUnsubscribe: "UNSUBSCRIBE",
@@ -123,6 +125,7 @@ var codeNames = map[byte]string{
 	CodeTopicRemoving: "TOPIC_REMOVING", CodeTooManyTopics: "TOO_MANY_TOPICS",
 	CodeOverloaded: "OVERLOADED", CodeStorageUnavailable: "STORAGE_UNAVAILABLE",
 	CodeRecovering: "RECOVERING", CodeNotLeader: "NOT_LEADER",
+	CodeAlreadyPrincipal: "ALREADY_PRINCIPAL",
 }
 
 // TypeName devolve o nome do comando, por exemplo "PUBLISH".
