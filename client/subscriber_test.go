@@ -458,3 +458,128 @@ func TestSubscriberBuffersEarlyMessagesAndBackpressuresBurst(t *testing.T) {
 		t.Fatal("broker não recebeu todos os DELIVERY_ACKs")
 	}
 }
+
+
+// TestSubscriberSameEpochKeepsTopicIDForEarlyRedelivery verifica que uma
+// reconexão na mesma época pode reconhecer MESSAGE reenviado logo após STATUS,
+// antes mesmo de RESOLVE_TOPIC terminar.
+func TestSubscriberSameEpochKeepsTopicIDForEarlyRedelivery(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	allowFirstDrop := make(chan struct{})
+	handled := make(chan struct{}, 1)
+	serverDone := make(chan error, 1)
+
+	go func() {
+		first, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if err := subscriberHandshake(first, 83); err != nil {
+			_ = first.Close()
+			serverDone <- err
+			return
+		}
+		if _, err := readExpectedFrame(first, protocol.TypeResolveTopic); err != nil {
+			_ = first.Close()
+			serverDone <- err
+			return
+		}
+		if err := answer(first, protocol.Frame{Type: protocol.TypeTopicID, TopicID: 14}); err != nil {
+			_ = first.Close()
+			serverDone <- err
+			return
+		}
+		if _, err := readExpectedFrame(first, protocol.TypeSubscribe); err != nil {
+			_ = first.Close()
+			serverDone <- err
+			return
+		}
+		if err := answer(first, protocol.Frame{Type: protocol.TypeOK}); err != nil {
+			_ = first.Close()
+			serverDone <- err
+			return
+		}
+		<-allowFirstDrop
+		_ = first.Close()
+
+		second, err := listener.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer second.Close()
+		if _, err := readExpectedFrame(second, protocol.TypeHello); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := answer(second, protocol.Frame{Type: protocol.TypeStatus, Role: protocol.RolePrincipal, Epoch: 1}); err != nil {
+			serverDone <- err
+			return
+		}
+		if err := answer(second, protocol.Frame{
+			Type: protocol.TypeMessage, TopicID: 14, DeliveryID: 909, Payload: []byte{9},
+		}); err != nil {
+			serverDone <- err
+			return
+		}
+
+		if _, err := readExpectedFrame(second, protocol.TypeResolveTopic); err != nil {
+			serverDone <- err
+			return
+		}
+		// O ACK precisa chegar antes de responder RESOLVE_TOPIC. Isso comprova
+		// que o mapa byTopicID foi preservado na reconexão da mesma época.
+		ack, err := readExpectedFrame(second, protocol.TypeDeliveryAck)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if ack.DeliveryID != 909 {
+			serverDone <- errors.New("DELIVERY_ACK incorreto para entrega antecipada")
+			return
+		}
+		if err := answer(second, protocol.Frame{Type: protocol.TypeTopicID, TopicID: 14}); err != nil {
+			serverDone <- err
+			return
+		}
+		if _, err := readExpectedFrame(second, protocol.TypeSubscribe); err != nil {
+			serverDone <- err
+			return
+		}
+		serverDone <- answer(second, protocol.Frame{Type: protocol.TypeOK})
+	}()
+
+	sub, err := NewSubscriber(Config{Brokers: []string{listener.Addr().String()}, ClientID: 83})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := sub.Subscribe("mar/temperatura", func([]byte) error {
+		handled <- struct{}{}
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe(): %v", err)
+	}
+	close(allowFirstDrop)
+
+	select {
+	case <-handled:
+	case <-time.After(8 * time.Second):
+		t.Fatal("MESSAGE antecipado não foi entregue na reconexão da mesma época")
+	}
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("broker falso: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("broker não concluiu a verificação da reconexão")
+	}
+}
