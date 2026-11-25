@@ -26,6 +26,10 @@ type subscription struct {
 	done    chan struct{}
 	once    sync.Once
 
+	// queueMu mantém a ordem entre mensagens recebidas antes do registro do
+	// topic_id e mensagens que chegam enquanto o backlog é transferido.
+	queueMu sync.Mutex
+
 	handlerMu sync.RWMutex
 	handler   func([]byte) error
 }
@@ -68,6 +72,11 @@ type subscriber struct {
 	subs      map[string]*subscription
 	byTopicID map[uint8]*subscription
 
+	// O broker pode reenviar entregas logo após HELLO, antes de a aplicação
+	// chamar Subscribe e resolver os topic_ids. Mantemos essas mensagens até
+	// que o mapeamento local seja reconstruído.
+	pendingByTopicID map[uint8][]delivery
+
 	reconnect chan struct{}
 }
 
@@ -88,9 +97,10 @@ func NewSubscriber(cfg Config) (Subscriber, error) {
 		cfg:       cfg,
 		ctx:       ctx,
 		cancel:    cancel,
-		subs:      make(map[string]*subscription),
-		byTopicID: make(map[uint8]*subscription),
-		reconnect: make(chan struct{}, 1),
+		subs:             make(map[string]*subscription),
+		byTopicID:        make(map[uint8]*subscription),
+		pendingByTopicID: make(map[uint8][]delivery),
+		reconnect:        make(chan struct{}, 1),
 	}
 	s.wg.Add(1)
 	go s.reconnectLoop()
@@ -137,8 +147,10 @@ func (s *subscriber) Subscribe(topic string, handler func(payload []byte) error)
 	// processar o comando, inclusive antes de a resposta OK ser lida.
 	s.mu.Lock()
 	s.subs[topic] = sub
-	s.byTopicID[id] = sub
 	s.mu.Unlock()
+	// Registra o topic_id e inicia o worker antes de SUBSCRIBE: mensagens
+	// antigas podem chegar logo após HELLO, e novas logo após o SUBSCRIBE.
+	s.registerSubscriptionID(sub, id, true)
 
 	reply, err := s.exchange(conn, protocol.Frame{Type: protocol.TypeSubscribe, TopicID: id})
 	if err != nil || reply.Type != protocol.TypeOK {
@@ -151,8 +163,6 @@ func (s *subscriber) Subscribe(topic string, handler func(payload []byte) error)
 		return err
 	}
 
-	s.wg.Add(1)
-	go s.subscriptionLoop(sub)
 	return nil
 }
 
@@ -205,6 +215,7 @@ func (s *subscriber) Close() error {
 	}
 	s.subs = make(map[string]*subscription)
 	s.byTopicID = make(map[uint8]*subscription)
+	s.pendingByTopicID = make(map[uint8][]delivery)
 	s.mu.Unlock()
 
 	if conn != nil {
@@ -290,6 +301,7 @@ func (s *subscriber) connectLocked() (*subscriberConn, error) {
 			s.maxEpoch = status.Epoch
 			s.mu.Lock()
 			s.byTopicID = make(map[uint8]*subscription)
+			s.pendingByTopicID = make(map[uint8][]delivery)
 			for _, sub := range s.subs {
 				sub.topicID = 0
 			}
@@ -380,24 +392,80 @@ func (s *subscriber) readLoop(conn *subscriberConn) {
 }
 
 func (s *subscriber) dispatch(conn *wireConn, frame protocol.Frame) {
-	s.mu.RLock()
-	sub := s.byTopicID[frame.TopicID]
-	s.mu.RUnlock()
-	if sub == nil {
-		return // sem assinatura local: não confirmar; o broker poderá reenviar.
-	}
-
 	item := delivery{
 		conn:    conn,
 		id:      frame.DeliveryID,
 		payload: append([]byte(nil), frame.Payload...),
 	}
+
+	s.mu.Lock()
+	sub := s.byTopicID[frame.TopicID]
+	if sub == nil {
+		if !s.closed {
+			s.pendingByTopicID[frame.TopicID] = append(s.pendingByTopicID[frame.TopicID], item)
+		}
+		s.mu.Unlock()
+		return // o topic_id ainda será associado quando Subscribe resolver o tópico.
+	}
+	s.mu.Unlock()
+
+	s.enqueueDelivery(sub, item)
+}
+
+// registerSubscriptionID associa um topic_id à assinatura e transfere, em
+// ordem, mensagens que chegaram antes de o mapeamento estar disponível.
+func (s *subscriber) registerSubscriptionID(sub *subscription, id uint8, startWorker bool) {
+	sub.queueMu.Lock()
+	defer sub.queueMu.Unlock()
+
+	s.mu.Lock()
+	sub.topicID = id
+	s.byTopicID[id] = sub
+	pending := s.pendingByTopicID[id]
+	delete(s.pendingByTopicID, id)
+	s.mu.Unlock()
+
+	if startWorker {
+		s.wg.Add(1)
+		go s.subscriptionLoop(sub)
+	}
+
+	for _, item := range pending {
+		select {
+		case <-item.conn.done:
+			continue
+		default:
+		}
+		select {
+		case sub.queue <- item:
+		case <-sub.done:
+			return
+		case <-s.ctx.Done():
+			return
+		case <-item.conn.done:
+			// Sem a conexão original não é possível confirmar; o broker reenviará.
+			continue
+		}
+	}
+}
+
+// enqueueDelivery aplica backpressure: quando a fila da assinatura enche,
+// a leitora para de consumir o TCP até o handler liberar espaço. Nenhuma
+// entrega é descartada silenciosamente por falta de capacidade local.
+func (s *subscriber) enqueueDelivery(sub *subscription, item delivery) {
+	sub.queueMu.Lock()
+	defer sub.queueMu.Unlock()
+
+	select {
+	case <-item.conn.done:
+		return
+	default:
+	}
 	select {
 	case sub.queue <- item:
 	case <-sub.done:
 	case <-s.ctx.Done():
-	default:
-		// Fila local da assinatura cheia: não enviar ACK; o broker tentará novamente.
+	case <-item.conn.done:
 	}
 }
 
@@ -437,7 +505,9 @@ func (s *subscriber) markDisconnected(conn *subscriberConn) {
 	s.mu.Lock()
 	if s.active == conn {
 		s.active = nil
-		s.byTopicID = make(map[uint8]*subscription)
+		// Mantém byTopicID durante uma reconexão na mesma época: o broker
+		// pode reenviar pendências imediatamente após HELLO, antes de RESOLVE.
+		// Uma época maior limpa o mapa em connectLocked.
 	}
 	hasSubs := len(s.subs) > 0
 	closed := s.closed
@@ -508,10 +578,7 @@ func (s *subscriber) restoreSubscriptionsLocked(conn *subscriberConn) error {
 		if err != nil {
 			return err
 		}
-		sub.topicID = id
-		s.mu.Lock()
-		s.byTopicID[id] = sub
-		s.mu.Unlock()
+		s.registerSubscriptionID(sub, id, false)
 		reply, err := s.exchange(conn, protocol.Frame{Type: protocol.TypeSubscribe, TopicID: id})
 		if err != nil {
 			return err
