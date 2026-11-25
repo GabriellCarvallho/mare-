@@ -459,7 +459,6 @@ func TestSubscriberBuffersEarlyMessagesAndBackpressuresBurst(t *testing.T) {
 	}
 }
 
-
 // TestSubscriberSameEpochKeepsTopicIDForEarlyRedelivery verifica que uma
 // reconexão na mesma época pode reconhecer MESSAGE reenviado logo após STATUS,
 // antes mesmo de RESOLVE_TOPIC terminar.
