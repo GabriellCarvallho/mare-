@@ -528,20 +528,29 @@ func TestSubscriberSameEpochKeepsTopicIDForEarlyRedelivery(t *testing.T) {
 			return
 		}
 
-		if _, err := readExpectedFrame(second, protocol.TypeResolveTopic); err != nil {
-			serverDone <- err
-			return
-		}
-		// O ACK precisa chegar antes de responder RESOLVE_TOPIC. Isso comprova
-		// que o mapa byTopicID foi preservado na reconexão da mesma época.
-		ack, err := readExpectedFrame(second, protocol.TypeDeliveryAck)
-		if err != nil {
-			serverDone <- err
-			return
-		}
-		if ack.DeliveryID != 909 {
-			serverDone <- errors.New("DELIVERY_ACK incorreto para entrega antecipada")
-			return
+		// O ACK precisa chegar antes de responder RESOLVE_TOPIC. Como os dois
+		// quadros podem ser escritos por goroutines diferentes, aceitamos ambos
+		// em qualquer ordem e só respondemos quando os dois chegaram.
+		resolveSeen, ackSeen := false, false
+		for !resolveSeen || !ackSeen {
+			frame, err := protocol.ReadFrame(second)
+			if err != nil {
+				serverDone <- err
+				return
+			}
+			switch frame.Type {
+			case protocol.TypeResolveTopic:
+				resolveSeen = true
+			case protocol.TypeDeliveryAck:
+				if frame.DeliveryID != 909 {
+					serverDone <- errors.New("DELIVERY_ACK incorreto para entrega antecipada")
+					return
+				}
+				ackSeen = true
+			default:
+				serverDone <- errors.New("quadro inesperado durante a recuperação da assinatura")
+				return
+			}
 		}
 		if err := answer(second, protocol.Frame{Type: protocol.TypeTopicID, TopicID: 14}); err != nil {
 			serverDone <- err
