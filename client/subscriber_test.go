@@ -366,3 +366,96 @@ func TestSubscriberReconnectsAndResolvesChangedTopicID(t *testing.T) {
 		t.Fatalf("broker falso: %v", err)
 	}
 }
+
+
+// TestSubscriberBuffersEarlyMessagesAndBackpressuresBurst reproduz o caso em
+// que o broker reenvia pendências imediatamente após HELLO e envia um backlog
+// maior que a capacidade da fila local da assinatura.
+func TestSubscriberBuffersEarlyMessagesAndBackpressuresBurst(t *testing.T) {
+	const total = 70 // maior que a fila de 64 mensagens por assinatura
+	handled := make(chan byte, total)
+
+	address, serverDone := startSubscriberTestServer(t, func(conn net.Conn) error {
+		if err := subscriberHandshake(conn, 82); err != nil {
+			return err
+		}
+
+		// Entrega pendente chega antes de o cliente resolver o topic_id.
+		if err := answer(conn, protocol.Frame{
+			Type: protocol.TypeMessage, TopicID: 12, DeliveryID: 1, Payload: []byte{1},
+		}); err != nil {
+			return err
+		}
+
+		if _, err := readExpectedFrame(conn, protocol.TypeResolveTopic); err != nil {
+			return err
+		}
+		if err := answer(conn, protocol.Frame{Type: protocol.TypeTopicID, TopicID: 12}); err != nil {
+			return err
+		}
+		if _, err := readExpectedFrame(conn, protocol.TypeSubscribe); err != nil {
+			return err
+		}
+		if err := answer(conn, protocol.Frame{Type: protocol.TypeOK}); err != nil {
+			return err
+		}
+
+		// Rajada superior à capacidade da fila. A leitora precisa aplicar
+		// backpressure, não descartar as mensagens excedentes.
+		for i := byte(2); i <= total; i++ {
+			if err := answer(conn, protocol.Frame{
+				Type: protocol.TypeMessage, TopicID: 12, DeliveryID: uint32(i), Payload: []byte{i},
+			}); err != nil {
+				return err
+			}
+		}
+		for i := uint32(1); i <= total; i++ {
+			ack, err := readExpectedFrame(conn, protocol.TypeDeliveryAck)
+			if err != nil {
+				return err
+			}
+			if ack.DeliveryID != i {
+				return errors.New("DELIVERY_ACK recebido fora de ordem")
+			}
+		}
+		return nil
+	})
+
+	sub, err := NewSubscriber(Config{Brokers: []string{address}, ClientID: 82})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+
+	if err := sub.Subscribe("mar/temperatura", func(payload []byte) error {
+		// Torna o consumo deliberadamente mais lento que a chegada da rajada.
+		time.Sleep(2 * time.Millisecond)
+		if len(payload) != 1 {
+			return errors.New("payload de teste inválido")
+		}
+		handled <- payload[0]
+		return nil
+	}); err != nil {
+		t.Fatalf("Subscribe(): %v", err)
+	}
+
+	for expected := byte(1); expected <= total; expected++ {
+		select {
+		case got := <-handled:
+			if got != expected {
+				t.Fatalf("mensagem fora de ordem: recebeu %d, esperava %d", got, expected)
+			}
+		case <-time.After(8 * time.Second):
+			t.Fatalf("mensagem %d não foi entregue", expected)
+		}
+	}
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("broker falso: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("broker não recebeu todos os DELIVERY_ACKs")
+	}
+}
