@@ -23,6 +23,31 @@ type reading struct {
 	TemperatureC float64
 }
 
+// readingDeduplicator identifica cada leitura pelo par (sensor_id, sequence).
+// Não usa apenas a maior sequência, pois o escalonador pode entregar mensagens
+// CRÍTICAS antes de mensagens NORMAL mais antigas.
+type readingDeduplicator struct {
+	mu   sync.Mutex
+	seen map[uint16]map[uint32]struct{}
+}
+
+// Seen retorna true quando a sequência deste sensor já foi processada.
+func (d *readingDeduplicator) Seen(sensorID uint16, sequence uint32) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	sequences := d.seen[sensorID]
+	if sequences == nil {
+		sequences = make(map[uint32]struct{})
+		d.seen[sensorID] = sequences
+	}
+	if _, exists := sequences[sequence]; exists {
+		return true
+	}
+	sequences[sequence] = struct{}{}
+	return false
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatal(err)
@@ -30,7 +55,7 @@ func main() {
 }
 
 func run() error {
-	brokersFlag := flag.String("brokers", "127.0.0.1:9000", "endereços dos brokers separados por vírgula")
+	brokersFlag := flag.String("brokers", "127.0.0.1:7000", "endereços dos brokers separados por vírgula")
 	clientIDFlag := flag.Uint("client-id", 100, "identificador deste consumidor (1 a 65535)")
 	topicFlag := flag.String("topic", "mar/temperatura", "tópico assinado")
 	flag.Parse()
@@ -52,22 +77,19 @@ func run() error {
 	}
 	defer subscriber.Close()
 
-	var mu sync.Mutex
-	lastSequence := make(map[uint16]uint32)
+	deduper := &readingDeduplicator{seen: make(map[uint16]map[uint32]struct{})}
 	handler := func(payload []byte) error {
 		item, err := decodeReading(payload)
 		if err != nil {
-			return err // sem ACK: o broker poderá reenviar a entrega
+			// Payload inválido é irrecuperável para esta aplicação: registra o
+			// problema e confirma para não repetir até a quarentena.
+			log.Printf("mensagem descartada: payload inválido: %v", err)
+			return nil
 		}
 
-		mu.Lock()
-		last, exists := lastSequence[item.SensorID]
-		if exists && item.Sequence <= last {
-			mu.Unlock()
-			return nil // repetida ou atrasada: confirma sem processar novamente
+		if deduper.Seen(item.SensorID, item.Sequence) {
+			return nil // duplicata exata: confirma sem processar novamente
 		}
-		lastSequence[item.SensorID] = item.Sequence
-		mu.Unlock()
 
 		measuredAt := time.Unix(int64(item.Timestamp), 0).UTC()
 		log.Printf("sensor=%d leitura=%d horário=%s temperatura=%.2f °C",
