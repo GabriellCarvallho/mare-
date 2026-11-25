@@ -26,7 +26,7 @@ func main() {
 }
 
 func run() error {
-	brokersFlag := flag.String("brokers", "127.0.0.1:9000", "endereços dos brokers separados por vírgula")
+	brokersFlag := flag.String("brokers", "127.0.0.1:7000", "endereços dos brokers separados por vírgula")
 	sensorFlag := flag.Uint("sensor-id", 7, "identificador do sensor (1 a 65535)")
 	topicFlag := flag.String("topic", "mar/temperatura", "tópico das leituras")
 	thresholdFlag := flag.Float64("critical-above", 29.0, "temperatura acima da qual a leitura é crítica, em °C")
