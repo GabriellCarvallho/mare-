@@ -367,7 +367,6 @@ func TestSubscriberReconnectsAndResolvesChangedTopicID(t *testing.T) {
 	}
 }
 
-
 // TestSubscriberBuffersEarlyMessagesAndBackpressuresBurst reproduz o caso em
 // que o broker reenvia pendências imediatamente após HELLO e envia um backlog
 // maior que a capacidade da fila local da assinatura.
