@@ -91,9 +91,9 @@ func NewSubscriber(cfg Config) (Subscriber, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &subscriber{
-		cfg:       cfg,
-		ctx:       ctx,
-		cancel:    cancel,
+		cfg:              cfg,
+		ctx:              ctx,
+		cancel:           cancel,
 		subs:             make(map[string]*subscription),
 		byTopicID:        make(map[uint8]*subscription),
 		pendingByTopicID: make(map[uint8][]delivery),
