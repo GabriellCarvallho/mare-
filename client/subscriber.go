@@ -56,28 +56,25 @@ type subscriberConn struct {
 }
 
 type subscriber struct {
-	cfg Config
-
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	cfg              Config
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
 
 	// opMu serializa Subscribe, Unsubscribe e a recuperação da conexão.
-	opMu sync.Mutex
-	mu   sync.RWMutex
-
-	closed    bool
-	active    *subscriberConn
-	maxEpoch  uint32
-	subs      map[string]*subscription
-	byTopicID map[uint8]*subscription
+	opMu             sync.Mutex
+	mu               sync.RWMutex
+	closed           bool
+	active           *subscriberConn
+	maxEpoch         uint32
+	subs             map[string]*subscription
+	byTopicID        map[uint8]*subscription
 
 	// O broker pode reenviar entregas logo após HELLO, antes de a aplicação
 	// chamar Subscribe e resolver os topic_ids. Mantemos essas mensagens até
 	// que o mapeamento local seja reconstruído.
 	pendingByTopicID map[uint8][]delivery
-
-	reconnect chan struct{}
+	reconnect        chan struct{}
 }
 
 // NewSubscriber cria um assinante. A conexão é aberta quando Subscribe é chamado.
