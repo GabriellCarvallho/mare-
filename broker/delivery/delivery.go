@@ -45,12 +45,33 @@ type entry struct {
 }
 
 type Manager struct {
-	nextID uint32
-	byID   map[uint32]*entry // só entregas pendentes (aguardando ou em voo)
+	nextID   uint32
+	byID     map[uint32]*entry            // só entregas pendentes (aguardando ou em voo)
+	byClient map[uint16]map[uint32]*entry // as mesmas, por assinante
+	inFlight map[uint16]int               // quantas estão em voo, por assinante
 }
 
 func New() *Manager {
-	return &Manager{byID: make(map[uint32]*entry)}
+	return &Manager{
+		byID:     make(map[uint32]*entry),
+		byClient: make(map[uint16]map[uint32]*entry),
+		inFlight: make(map[uint16]int),
+	}
+}
+
+// remove tira a entrega dos índices (ACK ou quarentena).
+func (m *Manager) remove(e *entry) {
+	if e.state == inFlight {
+		m.inFlight[e.Client]--
+	}
+	delete(m.byID, e.ID)
+	if c := m.byClient[e.Client]; c != nil {
+		delete(c, e.ID)
+		if len(c) == 0 {
+			delete(m.byClient, e.Client)
+			delete(m.inFlight, e.Client)
+		}
+	}
 }
 
 // Timeout devolve o prazo depois de n falhas: 5s, 10s, 20s, 40s, 60s, 60s...
@@ -86,10 +107,15 @@ func (m *Manager) Add(ref uint64, clients []uint16) []Delivery {
 			Client: client,
 		}
 
-		m.byID[d.ID] = &entry{
+		e := &entry{
 			Delivery: d,
 			state:    waiting,
 		}
+		m.byID[d.ID] = e
+		if m.byClient[client] == nil {
+			m.byClient[client] = make(map[uint32]*entry)
+		}
+		m.byClient[client][d.ID] = e
 
 		deliveries = append(deliveries, d)
 	}
@@ -104,6 +130,9 @@ func (m *Manager) MarkSent(id uint32, now time.Time) {
 		return
 	}
 
+	if e.state == waiting {
+		m.inFlight[e.Client]++
+	}
 	e.state = inFlight
 	e.deadline = now.Add(Timeout(e.Failures))
 }
@@ -130,7 +159,7 @@ func (m *Manager) Ack(id uint32, client uint16) (ref uint64, ok bool) {
 		return 0, false
 	}
 
-	delete(m.byID, id)
+	m.remove(e)
 
 	return e.Ref, true
 }
@@ -138,11 +167,31 @@ func (m *Manager) Ack(id uint32, client uint16) (ref uint64, ok bool) {
 // Disconnected devolve para AGUARDANDO as entregas em voo do cliente, sem
 // contar falha: ele recebe de novo quando reconectar.
 func (m *Manager) Disconnected(client uint16) {
-	for _, e := range m.byID {
-		if e.Client == client && e.state == inFlight {
-			e.state = waiting
+	for _, e := range m.byClient[client] {
+		e.state = waiting
+	}
+	if m.inFlight[client] > 0 {
+		m.inFlight[client] = 0
+	}
+}
+
+// InFlight conta as entregas do assinante enviadas e ainda sem ACK. O
+// servidor usa para limitar a janela de envio por assinante.
+func (m *Manager) InFlight(client uint16) int {
+	return m.inFlight[client]
+}
+
+// Waiting devolve as entregas do assinante que aguardam envio, em ordem de
+// ID (a ordem de chegada). O servidor escolhe entre elas pela prioridade.
+func (m *Manager) Waiting(client uint16) []Delivery {
+	var out []Delivery
+	for _, e := range m.byClient[client] {
+		if e.state == waiting {
+			out = append(out, e.Delivery)
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
 }
 
 // Tick avança o relógio. Entregas em voo com prazo vencido ganham uma falha:
@@ -150,17 +199,18 @@ func (m *Manager) Disconnected(client uint16) {
 // Devolve as entregas a enviar agora (AGUARDANDO de clientes conectados, em
 // ordem de ID) e as que acabaram de entrar em quarentena.
 func (m *Manager) Tick(now time.Time, online func(client uint16) bool) (send, quarantined []Delivery) {
-	for id, e := range m.byID {
+	for _, e := range m.byID {
 		if e.state == inFlight && !now.Before(e.deadline) {
 			e.Failures++
 
 			if e.Failures >= MaxAttempts {
 				quarantined = append(quarantined, e.Delivery)
-				delete(m.byID, id) // apagar durante o range é permitido em Go
+				m.remove(e) // apagar durante o range é permitido em Go
 				continue
 			}
 
 			e.state = waiting
+			m.inFlight[e.Client]--
 		}
 
 		if e.state == waiting && online(e.Client) {

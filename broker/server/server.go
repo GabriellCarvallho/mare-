@@ -57,6 +57,9 @@ type Config struct {
 	Now           func() time.Time                 // relógio (padrão time.Now; os testes trocam)
 	OpenLog       func(path string) (Log, error)   // abre o log (padrão: em memória, sem persistência)
 	CompactEvery  int                              // compacta a cada N publicações concluídas (padrão 1.000)
+	SendWindow    int                              // entregas em voo por assinante (padrão 32; window.go)
+
+	onStart func(*broker) // só para testes: recebe o broker antes de escutar
 }
 
 // broker guarda o estado compartilhado. Tudo que várias goroutines leem ou
@@ -91,6 +94,8 @@ type broker struct {
 
 	// Passo 7
 	recoveringUntil time.Time // até quando PUBLISH recebe RECOVERING
+
+	fair map[uint16]*fairness // regra 3:1 e rodízio por assinante (window.go)
 
 	wg sync.WaitGroup // espera as goroutines no encerramento
 }
@@ -135,6 +140,9 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.CompactEvery <= 0 {
 		cfg.CompactEvery = 1000
 	}
+	if cfg.SendWindow <= 0 {
+		cfg.SendWindow = DefaultSendWindow
+	}
 	if cfg.Recovery == 0 {
 		cfg.Recovery = DefaultRecovery
 	} else if cfg.Recovery < 0 {
@@ -154,9 +162,14 @@ func Run(ctx context.Context, cfg Config) error {
 		nextRef:  1,
 		now:      cfg.Now,
 		fatal:    make(chan error, 1),
+		fair:     make(map[uint16]*fairness),
 	}
 	if cfg.Role == RolePrincipal {
 		b.role = protocol.RolePrincipal
+	}
+
+	if cfg.onStart != nil {
+		cfg.onStart(b)
 	}
 
 	// Passo 7: a época vem do disco (DataDir/epoch).

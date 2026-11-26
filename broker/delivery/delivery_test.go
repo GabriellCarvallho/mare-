@@ -167,3 +167,55 @@ func TestLookup(t *testing.T) {
 		t.Fatal("entrega confirmada não deveria ser encontrada")
 	}
 }
+
+// A janela por assinante do servidor depende destas contagens.
+func TestInFlightEWaiting(t *testing.T) {
+	m := New()
+	now := time.Unix(0, 0)
+	ds := m.Add(1, []uint16{10, 20})
+	more := m.Add(2, []uint16{10})
+
+	if n := len(m.Waiting(10)); n != 2 {
+		t.Fatalf("Waiting(10) = %d, esperado 2", n)
+	}
+	m.MarkSent(ds[0].ID, now)
+	m.MarkSent(ds[0].ID, now) // marcar de novo não conta duas vezes
+	if m.InFlight(10) != 1 || len(m.Waiting(10)) != 1 || m.Waiting(10)[0].ID != more[0].ID {
+		t.Fatalf("depois do envio: InFlight=%d Waiting=%v", m.InFlight(10), m.Waiting(10))
+	}
+	if m.InFlight(20) != 0 {
+		t.Fatalf("InFlight(20) = %d, esperado 0", m.InFlight(20))
+	}
+
+	// Prazo vencido: volta a aguardar e sai da contagem em voo.
+	m.Tick(now.Add(InitialTimeout), func(uint16) bool { return true })
+	if m.InFlight(10) != 0 || len(m.Waiting(10)) != 2 {
+		t.Fatalf("depois do prazo: InFlight=%d Waiting=%d", m.InFlight(10), len(m.Waiting(10)))
+	}
+
+	// Desconexão zera a contagem; ACK tira a entrega dos índices.
+	m.MarkSent(ds[0].ID, now)
+	m.MarkSent(more[0].ID, now)
+	m.Disconnected(10)
+	if m.InFlight(10) != 0 || len(m.Waiting(10)) != 2 {
+		t.Fatalf("depois da desconexão: InFlight=%d Waiting=%d", m.InFlight(10), len(m.Waiting(10)))
+	}
+	m.MarkSent(ds[0].ID, now)
+	if _, ok := m.Ack(ds[0].ID, 10); !ok {
+		t.Fatal("Ack falhou")
+	}
+	if m.InFlight(10) != 0 || len(m.Waiting(10)) != 1 {
+		t.Fatalf("depois do ACK: InFlight=%d Waiting=%d", m.InFlight(10), len(m.Waiting(10)))
+	}
+
+	// Quarentena também tira dos índices.
+	m.MarkSent(more[0].ID, now)
+	for i := 0; i < MaxAttempts; i++ {
+		now = now.Add(MaxBackoff)
+		m.Tick(now, func(uint16) bool { return false })
+		m.MarkSent(more[0].ID, now)
+	}
+	if m.InFlight(10) != 0 || len(m.Waiting(10)) != 0 {
+		t.Fatalf("depois da quarentena: InFlight=%d Waiting=%d", m.InFlight(10), len(m.Waiting(10)))
+	}
+}

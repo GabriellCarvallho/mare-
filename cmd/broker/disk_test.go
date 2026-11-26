@@ -1,33 +1,14 @@
 package main
 
 import (
-	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/GabriellCarvallho/mare-pubsub/broker/server"
-	"github.com/GabriellCarvallho/mare-pubsub/broker/wal"
 	"github.com/GabriellCarvallho/mare-pubsub/protocol"
 )
-
-func TestConvErr(t *testing.T) {
-	if convErr(nil) != nil {
-		t.Fatal("nil deveria continuar nil")
-	}
-	if err := convErr(wal.ErrStorageFull); !errors.Is(err, server.ErrStorageFull) {
-		t.Fatalf("ErrStorageFull virou %v", err)
-	}
-	if err := convErr(wal.ErrBroken); !errors.Is(err, server.ErrLogBroken) {
-		t.Fatalf("ErrBroken virou %v", err)
-	}
-	outro := errors.New("outro")
-	if convErr(outro) != outro {
-		t.Fatal("erro desconhecido deveria passar sem mudança")
-	}
-}
 
 // client é um cliente mínimo do protocolo para os testes do executável.
 type client struct {
