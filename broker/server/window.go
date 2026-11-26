@@ -79,16 +79,17 @@ func (b *broker) fill(client uint16, now time.Time) {
 		b.fair[client] = f
 	}
 	for free > 0 && counts[classNormal]+counts[classCritical] > 0 {
+		// Escolhe a classe sem mexer no estado: ele só muda depois que send
+		// confirmar o envio, para uma tentativa que falhou não gastar uma das
+		// vagas da rajada de críticas.
 		c := classNormal
+		streak := 0
 		switch {
 		case counts[classNormal] == 0:
-			c = classCritical
-			f.streak = 0 // só críticas: nenhuma normal esperando por elas
+			c = classCritical // só críticas: nenhuma normal esperando por elas
 		case counts[classCritical] > 0 && f.streak < criticalBurst(b.cfg.Sched):
 			c = classCritical
-			f.streak++
-		default:
-			f.streak = 0
+			streak = f.streak + 1
 		}
 
 		pub := nextPublisher(queues[c], f.lastPub[c], f.hasLast[c])
@@ -96,6 +97,7 @@ func (b *broker) fill(client uint16, now time.Time) {
 		if !b.send(d, now) {
 			return // fila da conexão cheia: o relógio tenta de novo
 		}
+		f.streak = streak
 		f.lastPub[c], f.hasLast[c] = pub, true
 		queues[c][pub] = queues[c][pub][1:]
 		if len(queues[c][pub]) == 0 {

@@ -33,7 +33,8 @@ func freeAddr(t *testing.T) string {
 
 // broker sobe um broker real com o log em disco em dataDir e devolve uma
 // função que o derruba (como um Ctrl+C).
-func broker(t *testing.T, addr, role, dataDir string, recovery time.Duration) (stop func()) {
+// opts ajusta a configuração (por exemplo, uma cota menor).
+func broker(t *testing.T, addr, role, dataDir string, recovery time.Duration, opts ...func(*server.Config)) (stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	up := make(chan struct{})
@@ -47,6 +48,9 @@ func broker(t *testing.T, addr, role, dataDir string, recovery time.Duration) (s
 		OpenLog:       walstore.Open,
 		OnListen:      func(net.Addr) { close(up) },
 		Logf:          func(string, ...any) {},
+	}
+	for _, o := range opts {
+		o(&cfg)
 	}
 	go func() { done <- server.Run(ctx, cfg) }()
 	select {

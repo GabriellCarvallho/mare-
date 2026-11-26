@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GabriellCarvallho/mare-pubsub/broker/sched"
 	"github.com/GabriellCarvallho/mare-pubsub/broker/server"
 	"github.com/GabriellCarvallho/mare-pubsub/broker/walstore"
 	"github.com/GabriellCarvallho/mare-pubsub/client"
@@ -42,6 +43,9 @@ func main() {
 	flag.Parse()
 	fmt.Printf("# Métricas do Maré Pub/Sub\n\nGerado em %s · %s/%s · %d CPUs · %s\n\n",
 		time.Now().Format("2006-01-02 15:04"), runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), runtime.Version())
+	fmt.Printf("Configuração: broker real e clientes no mesmo processo, TCP em 127.0.0.1; log em disco num diretório temporário (%s); "+
+		"janela de %d entregas por assinante; cota de %d pendências por sensor. Todas as seções abaixo vêm desta mesma execução.\n\n",
+		os.TempDir(), server.DefaultSendWindow, sched.DefaultPerPublisher)
 
 	bytesPorQuadro()
 	codificacao()
@@ -255,13 +259,42 @@ func (r *raw) topico(nome string) uint8 {
 	return f.TopicID
 }
 
-// assinanteCru: confirma cada MESSAGE e anota a hora de chegada por chave
-// (sensor<<32 | sequence). atraso simula um consumidor lento.
+// falhar encerra o medidor com erro: um resultado incompleto não é publicado
+// como se fosse válido.
+func falhar(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "marebench: "+format+"\n", args...)
+	os.Exit(1)
+}
+
+// chave monta a chave (sensor_id, sequence) de uma leitura.
+func chave(sensor uint16, seq uint32) uint64 { return uint64(sensor)<<32 | uint64(seq) }
+
+// assinanteCru: confirma cada MESSAGE e anota a hora da primeira chegada por
+// chave (sensor_id, sequence). total conta todos os MESSAGE, inclusive
+// repetições. atraso simula um consumidor lento.
 type assinanteCru struct {
 	mu      sync.Mutex
 	chegada map[uint64]time.Time
 	ordem   []uint64
 	total   atomic.Int64
+}
+
+// unicas devolve quantas leituras distintas já chegaram.
+func (a *assinanteCru) unicas() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.chegada)
+}
+
+// esperar aguarda n leituras distintas; se o limite passar, o medidor falha.
+func (a *assinanteCru) esperar(n int, limite time.Duration, etapa string) {
+	fim := time.Now().Add(limite)
+	for a.unicas() < n {
+		if time.Now().After(fim) {
+			falhar("%s: só %d de %d leituras distintas chegaram em %s", etapa, a.unicas(), n, limite)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func assinar(addr string, id uint16, topico string, atraso time.Duration) *assinanteCru {
@@ -281,7 +314,7 @@ func assinar(addr string, id uint16, topico string, atraso time.Duration) *assin
 			if f.Type != protocol.TypeMessage {
 				continue
 			}
-			k := uint64(binary.BigEndian.Uint16(f.Payload))<<32 | uint64(binary.BigEndian.Uint32(f.Payload[2:]))
+			k := chave(binary.BigEndian.Uint16(f.Payload), binary.BigEndian.Uint32(f.Payload[2:]))
 			agora := time.Now()
 			a.mu.Lock()
 			if _, ok := a.chegada[k]; !ok {
@@ -339,7 +372,7 @@ func vazao(disco bool) {
 			for s := 1; s <= porSensor; s++ {
 				t0 := time.Now()
 				mu.Lock()
-				envio[uint64(sensor)<<32|uint64(s)] = t0
+				envio[chave(sensor, uint32(s))] = t0
 				mu.Unlock()
 				r.send(protocol.Frame{Type: protocol.TypePublish, TopicID: tid, Flags: byte(s % 2), Payload: leitura(sensor, uint32(s))})
 				if f := r.recv(); f.Type != protocol.TypePublishAck {
@@ -354,16 +387,19 @@ func vazao(disco bool) {
 	}
 	wg.Wait()
 	total := porSensor * *publishers
-	for sub.total.Load() < int64(total) {
-		time.Sleep(time.Millisecond)
-	}
+	sub.esperar(total, 5*time.Minute, "vazão ("+nome+")")
 	dur := time.Since(inicio)
 
 	var e2e []time.Duration
 	sub.mu.Lock()
-	for k, t := range sub.chegada {
-		e2e = append(e2e, t.Sub(envio[k]))
+	for k, t0 := range envio {
+		t, ok := sub.chegada[k]
+		if !ok {
+			falhar("vazão (%s): leitura %d/%d não chegou", nome, k>>32, uint32(k))
+		}
+		e2e = append(e2e, t.Sub(t0))
 	}
+	repetidas := sub.total.Load() - int64(len(sub.chegada))
 	sub.mu.Unlock()
 
 	fmt.Printf("## Vazão e latência — log em %s\n\n", nome)
@@ -374,7 +410,8 @@ func vazao(disco bool) {
 	fmt.Printf("| Latência PUBLISH → PUBLISH_ACK, p50 (ms) | %s |\n", ms(pct(ackLat, 0.50)))
 	fmt.Printf("| Latência PUBLISH → PUBLISH_ACK, p95 (ms) | %s |\n", ms(pct(ackLat, 0.95)))
 	fmt.Printf("| Latência sensor → assinante, p50 (ms) | %s |\n", ms(pct(e2e, 0.50)))
-	fmt.Printf("| Latência sensor → assinante, p95 (ms) | %s |\n\n", ms(pct(e2e, 0.95)))
+	fmt.Printf("| Latência sensor → assinante, p95 (ms) | %s |\n", ms(pct(e2e, 0.95)))
+	fmt.Printf("| Entregas repetidas (reenvios) | %d |\n\n", repetidas)
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +447,8 @@ func distribuicao() {
 
 	// Sensores 2 (críticas) e 3 (normais): 50 leituras cada, uma por vez.
 	type res struct {
-		aceitas int
-		envio   map[uint32]time.Time
+		aceitas, recusadas int
+		envio              map[uint32]time.Time // só as aceitas
 	}
 	resultado := make([]res, 4)
 	var wg sync.WaitGroup
@@ -421,45 +458,53 @@ func distribuicao() {
 			defer wg.Done()
 			r := conectar(addr, sensor)
 			env := make(map[uint32]time.Time)
-			ok := 0
+			ok, recusadas := 0, 0
 			for s := 1; s <= 50; s++ {
 				var flags byte
 				if sensor == 2 {
 					flags = protocol.FlagCritical
 				}
-				env[uint32(s)] = time.Now()
+				t0 := time.Now()
 				r.send(protocol.Frame{Type: protocol.TypePublish, TopicID: tid, Flags: flags, Payload: leitura(sensor, uint32(s))})
 				if r.recv().Type == protocol.TypePublishAck {
 					ok++
+					env[uint32(s)] = t0
+				} else {
+					recusadas++
 				}
 			}
-			resultado[sensor] = res{ok, env}
+			resultado[sensor] = res{ok, recusadas, env}
 		}(sensor)
 	}
 	wg.Wait()
 	<-done1
 
 	esperado := int(aceitas.Load()) + resultado[2].aceitas + resultado[3].aceitas
-	limite := time.Now().Add(60 * time.Second)
-	for sub.total.Load() < int64(esperado) && time.Now().Before(limite) {
-		time.Sleep(10 * time.Millisecond)
-	}
+	sub.esperar(esperado, 2*time.Minute, "distribuição")
 	sub.mu.Lock()
 	pos := make(map[uint64]int)
 	for i, k := range sub.ordem {
 		pos[k] = i + 1
 	}
 	media := func(sensor uint16) (time.Duration, int) {
+		env := resultado[sensor].envio
+		if len(env) == 0 {
+			falhar("distribuição: nenhuma leitura do sensor %d foi aceita", sensor)
+		}
 		var soma time.Duration
 		ultima := 0
-		for s, t := range resultado[sensor].envio {
-			k := uint64(sensor)<<32 | uint64(s)
-			soma += sub.chegada[k].Sub(t)
+		for s, t := range env {
+			k := chave(sensor, s)
+			c, ok := sub.chegada[k]
+			if !ok {
+				falhar("distribuição: leitura %d/%d foi aceita, mas não chegou ao assinante", sensor, s)
+			}
+			soma += c.Sub(t)
 			if pos[k] > ultima {
 				ultima = pos[k]
 			}
 		}
-		return soma / time.Duration(len(resultado[sensor].envio)), ultima
+		return soma / time.Duration(len(env)), ultima
 	}
 	m2, u2 := media(2)
 	m3, u3 := media(3)
@@ -471,8 +516,8 @@ func distribuicao() {
 	fmt.Println("| Sensor | Aceitas | Recusadas (OVERLOADED) | Latência média até o assinante (ms) | Posição da última entrega |")
 	fmt.Println("|---|---:|---:|---:|---:|")
 	fmt.Printf("| 1 — monopolizador, normais | %d | %d | — | — |\n", aceitas.Load(), sobrecarga.Load())
-	fmt.Printf("| 2 — críticas | %d | 0 | %s | %d de %d |\n", resultado[2].aceitas, ms(m2), u2, len(pos))
-	fmt.Printf("| 3 — normais | %d | 0 | %s | %d de %d |\n\n", resultado[3].aceitas, ms(m3), u3, len(pos))
+	fmt.Printf("| 2 — críticas | %d | %d | %s | %d de %d |\n", resultado[2].aceitas, resultado[2].recusadas, ms(m2), u2, len(pos))
+	fmt.Printf("| 3 — normais | %d | %d | %s | %d de %d |\n\n", resultado[3].aceitas, resultado[3].recusadas, ms(m3), u3, len(pos))
 }
 
 // ---------------------------------------------------------------------------
@@ -570,16 +615,19 @@ func recuperacao(janela time.Duration) {
 	total := len(envio)
 	mu.Unlock()
 
+	if primeira.IsZero() {
+		falhar("recuperação (%s): nenhuma leitura feita depois da queda chegou", janela)
+	}
+	if faltando > 0 {
+		falhar("recuperação (%s): %d de %d leituras não foram entregues", janela, faltando, total)
+	}
+
 	fmt.Printf("## Recuperação depois da promoção — janela RECOVERING de %s\n\n", janela)
 	fmt.Println("Sensor publicando 1 leitura a cada 100 ms pela biblioteca cliente; o principal cai e o operador promove a reserva no mesmo instante.")
 	fmt.Println()
 	fmt.Println("| Medida | Valor |")
 	fmt.Println("|---|---:|")
 	fmt.Printf("| Comando PROMOTE (ms) | %s |\n", ms(promover))
-	if primeira.IsZero() {
-		fmt.Println("| Queda → primeira leitura nova entregue (s) | não chegou |")
-	} else {
-		fmt.Printf("| Queda → primeira leitura nova entregue (s) | %.1f |\n", primeira.Sub(queda).Seconds())
-	}
+	fmt.Printf("| Queda → primeira leitura nova entregue (s) | %.1f |\n", primeira.Sub(queda).Seconds())
 	fmt.Printf("| Leituras publicadas / não entregues | %d / %d |\n\n", total, faltando)
 }

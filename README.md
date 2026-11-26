@@ -32,17 +32,20 @@ go run ./cmd/marebench                               # métricas da Seção 9.3 
 go run ./cmd/maredump -payload temperatura 000F01000100070000019C6AE1F1D00A96
 ```
 
-Resultados medidos estão em [`docs/metricas.md`](docs/metricas.md). Em resumo, com o log em disco (fsync a cada confirmação):
+Os resultados ficam em [`docs/metricas.md`](docs/metricas.md), gerado pelo `marebench` numa só execução (o cabeçalho do arquivo diz a máquina e a configuração). Os números abaixo são dessa execução, arredondados: **máquina da entrega, linux/amd64, 12 CPUs, Go 1.27.4**, broker e clientes no mesmo processo por TCP local, log em disco com fsync a cada confirmação, 4 sensores e 1 assinante.
 
-| Medida | Valor |
+| Medida | Máquina da entrega (12 CPUs) |
 |---|---:|
 | PUBLISH de temperatura | 17 bytes (a mesma leitura em JSON: 135 bytes) |
-| Encode / Decode do PUBLISH | ~50 ns / ~40 ns |
-| Vazão, 4 sensores, 1 assinante | ~2.500 a 2.800 leituras/s |
-| Latência PUBLISH → PUBLISH_ACK, p50 / p95 | ~1,2 ms / ~3,3 ms |
-| Latência sensor → assinante, p50 / p95 | ~1,9 ms / ~4,1 ms |
-| Leitura crítica com consumidor lento e um sensor inundando | ~165 ms (sem a janela: ~2,4 s) |
+| Encode / Decode do PUBLISH | ~39 ns / ~27 ns (JSON: ~555 / ~730 ns) |
+| Vazão com log em disco | ~510 leituras/s |
+| Latência PUBLISH → PUBLISH_ACK, p50 / p95 | ~5,9 ms / ~10 ms |
+| Latência sensor → assinante, p50 / p95 | ~1,5 s / ~5,7 s |
+| Vazão com log em memória (sem fsync) | ~25.700 leituras/s |
+| Leitura crítica com consumidor lento e um sensor inundando | ~168 ms (sem a janela: ~2,4 s) |
 | Queda do principal → primeira leitura nova entregue | janela RECOVERING + 1 a 2 s (31 s com a janela padrão de 30 s) |
+
+Nessa máquina cada fsync leva ~6 ms: os sensores publicam mais rápido do que o disco grava também as confirmações de entrega, e as entregas se acumulam no broker durante o teste (por isso a latência até o assinante passa de 1 s, sem perda). Para comparação, **outra configuração** — linux/amd64, 2 CPUs, Go 1.24.7, fsync de ~1,2 ms, 4 execuções — deu 2.500 a 2.800 leituras/s e latência sensor → assinante de ~1,9 ms (p50) / ~4,1 ms (p95). O relatório de entrega traz as duas lado a lado.
 
 ## Arquitetura
 

@@ -1,6 +1,8 @@
 # Métricas do Maré Pub/Sub
 
-Gerado em 2026-11-25 21:03 · linux/amd64 · 12 CPUs · go1.27.4
+Gerado em 2026-11-26 17:16 · linux/amd64 · 12 CPUs · go1.27.4
+
+Configuração: broker real e clientes no mesmo processo, TCP em 127.0.0.1; log em disco num diretório temporário (/tmp); janela de 32 entregas por assinante; cota de 1000 pendências por sensor. Todas as seções abaixo vêm desta mesma execução.
 
 ## Bytes por quadro (prefixo de 2 bytes incluído)
 
@@ -24,11 +26,11 @@ Uma leitura completa (PUBLISH + PUBLISH_ACK + MESSAGE + DELIVERY_ACK) = 48 bytes
 
 | Operação | ns/op | alocações/op |
 |---|---:|---:|
-| Encode (binário) | 39 | 2 |
+| Encode (binário) | 38 | 2 |
 | AppendEncode com buffer reutilizado | 8 | 0 |
-| Decode (binário) | 27 | 0 |
-| json.Marshal (comparação) | 555 | 3 |
-| json.Unmarshal (comparação) | 730 | 0 |
+| Decode (binário) | 25 | 0 |
+| json.Marshal (comparação) | 559 | 3 |
+| json.Unmarshal (comparação) | 737 | 0 |
 
 ## Vazão e latência — log em memória
 
@@ -36,11 +38,12 @@ Uma leitura completa (PUBLISH + PUBLISH_ACK + MESSAGE + DELIVERY_ACK) = 48 bytes
 
 | Medida | Valor |
 |---|---:|
-| Vazão (leituras entregues por segundo) | 25700 |
-| Latência PUBLISH → PUBLISH_ACK, p50 (ms) | 0.09 |
-| Latência PUBLISH → PUBLISH_ACK, p95 (ms) | 0.51 |
-| Latência sensor → assinante, p50 (ms) | 0.94 |
-| Latência sensor → assinante, p95 (ms) | 6.42 |
+| Vazão (leituras entregues por segundo) | 30109 |
+| Latência PUBLISH → PUBLISH_ACK, p50 (ms) | 0.08 |
+| Latência PUBLISH → PUBLISH_ACK, p95 (ms) | 0.39 |
+| Latência sensor → assinante, p50 (ms) | 0.74 |
+| Latência sensor → assinante, p95 (ms) | 4.90 |
+| Entregas repetidas (reenvios) | 0 |
 
 ## Vazão e latência — log em disco (wal com fsync)
 
@@ -48,11 +51,12 @@ Uma leitura completa (PUBLISH + PUBLISH_ACK + MESSAGE + DELIVERY_ACK) = 48 bytes
 
 | Medida | Valor |
 |---|---:|
-| Vazão (leituras entregues por segundo) | 511 |
-| Latência PUBLISH → PUBLISH_ACK, p50 (ms) | 5.87 |
-| Latência PUBLISH → PUBLISH_ACK, p95 (ms) | 9.99 |
-| Latência sensor → assinante, p50 (ms) | 1518.88 |
-| Latência sensor → assinante, p95 (ms) | 5696.44 |
+| Vazão (leituras entregues por segundo) | 406 |
+| Latência PUBLISH → PUBLISH_ACK, p50 (ms) | 7.32 |
+| Latência PUBLISH → PUBLISH_ACK, p95 (ms) | 12.28 |
+| Latência sensor → assinante, p50 (ms) | 2215.65 |
+| Latência sensor → assinante, p95 (ms) | 7297.25 |
+| Entregas repetidas (reenvios) | 0 |
 
 ## Distribuição do atendimento com um sensor monopolizador
 
@@ -60,9 +64,9 @@ Consumidor lento (2 ms por leitura). O sensor 1 dispara 1500 leituras normais de
 
 | Sensor | Aceitas | Recusadas (OVERLOADED) | Latência média até o assinante (ms) | Posição da última entrega |
 |---|---:|---:|---:|---:|
-| 1 — monopolizador, normais | 1018 | 482 | — | — |
-| 2 — críticas | 50 | 0 | 167.64 | 132 de 1118 |
-| 3 — normais | 50 | 0 | 341.87 | 215 de 1118 |
+| 1 — monopolizador, normais | 1010 | 490 | — | — |
+| 2 — críticas | 50 | 0 | 162.25 | 124 de 1110 |
+| 3 — normais | 50 | 0 | 328.51 | 207 de 1110 |
 
 ## Recuperação depois da promoção — janela RECOVERING de 5s
 
@@ -70,7 +74,7 @@ Sensor publicando 1 leitura a cada 100 ms pela biblioteca cliente; o principal c
 
 | Medida | Valor |
 |---|---:|
-| Comando PROMOTE (ms) | 4.72 |
+| Comando PROMOTE (ms) | 5.08 |
 | Queda → primeira leitura nova entregue (s) | 7.0 |
 | Leituras publicadas / não entregues | 120 / 0 |
 
@@ -80,7 +84,7 @@ Sensor publicando 1 leitura a cada 100 ms pela biblioteca cliente; o principal c
 
 | Medida | Valor |
 |---|---:|
-| Comando PROMOTE (ms) | 3.32 |
+| Comando PROMOTE (ms) | 4.80 |
 | Queda → primeira leitura nova entregue (s) | 31.0 |
 | Leituras publicadas / não entregues | 360 / 0 |
 
