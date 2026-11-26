@@ -1,6 +1,4 @@
-package main
-
-// Adaptador: liga o wal do Felipe (broker/wal) ao broker (server.Log).
+// Package walstore liga o wal do Felipe (broker/wal) ao broker (server.Log).
 //
 // Os dois pacotes têm tipos parecidos mas diferentes (wal.Record e
 // server.Record) e erros próprios. O adaptador só converte de um para o
@@ -9,6 +7,10 @@ package main
 //	server.Record  ⇄  wal.Record        (mesmos campos: Kind e Data)
 //	wal.ErrStorageFull → server.ErrStorageFull  (broker responde STORAGE_UNAVAILABLE)
 //	wal.ErrBroken      → server.ErrLogBroken    (broker encerra: disco não confiável)
+//
+// Usado pelo cmd/broker (produção), pelos testes de ponta a ponta e pelo
+// cmd/marebench.
+package walstore
 
 import (
 	"errors"
@@ -18,41 +20,47 @@ import (
 	"github.com/GabriellCarvallho/mare-pubsub/broker/wal"
 )
 
-// maxLogBytes é o limite do log no disco (Seção 7.1: 512 MiB).
-const maxLogBytes = 512 << 20
+// MaxBytes é o limite do log no disco (Seção 7.1: 512 MiB).
+const MaxBytes = 512 << 20
 
-// openWAL é o server.Config.OpenLog de produção.
-func openWAL(path string) (server.Log, error) {
-	l, err := wal.Open(path, maxLogBytes)
+// Open abre o log em disco com o limite padrão. É o server.Config.OpenLog
+// de produção.
+func Open(path string) (server.Log, error) {
+	return OpenLimit(path, MaxBytes)
+}
+
+// OpenLimit abre o log com outro limite (testes de disco cheio).
+func OpenLimit(path string, maxBytes int64) (server.Log, error) {
+	l, err := wal.Open(path, maxBytes)
 	if err != nil {
 		return nil, fmt.Errorf("abrir log %s: %w", path, convErr(err))
 	}
-	return walAdapter{l}, nil
+	return adapter{l}, nil
 }
 
-type walAdapter struct{ l wal.Log }
+type adapter struct{ l wal.Log }
 
-func (a walAdapter) Append(r server.Record) (uint64, error) {
+func (a adapter) Append(r server.Record) (uint64, error) {
 	seq, err := a.l.Append(wal.Record{Kind: r.Kind, Data: r.Data})
 	return seq, convErr(err)
 }
 
-func (a walAdapter) Replay(fn func(seq uint64, r server.Record) error) error {
+func (a adapter) Replay(fn func(seq uint64, r server.Record) error) error {
 	return convErr(a.l.Replay(func(seq uint64, r wal.Record) error {
 		return fn(seq, server.Record{Kind: r.Kind, Data: r.Data})
 	}))
 }
 
-func (a walAdapter) Compact(keep func(seq uint64, r server.Record) bool) error {
+func (a adapter) Compact(keep func(seq uint64, r server.Record) bool) error {
 	return convErr(a.l.Compact(func(seq uint64, r wal.Record) bool {
 		return keep(seq, server.Record{Kind: r.Kind, Data: r.Data})
 	}))
 }
 
-func (a walAdapter) Close() error { return convErr(a.l.Close()) }
+func (a adapter) Close() error { return convErr(a.l.Close()) }
 
 // convErr traduz os erros do wal para os que o broker entende. O erro
-// original continua dentro (%w), para aparecer nas mensagens de log.
+// original continua dentro, para aparecer nas mensagens de log.
 func convErr(err error) error {
 	switch {
 	case err == nil:

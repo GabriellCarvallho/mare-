@@ -123,12 +123,12 @@ func (b *broker) dispatchLoop(ctx context.Context) {
 	}
 }
 
-// startDeliveries cria uma entrega por destinatário e tenta enviar.
-// Chamar com b.mu travado.
+// startDeliveries cria uma entrega por destinatário e envia o que couber na
+// janela de cada um (window.go). Chamar com b.mu travado.
 func (b *broker) startDeliveries(p *publication) {
 	now := b.now()
 	for _, d := range b.dm.Add(p.ref, p.recipients) {
-		b.send(d, now)
+		b.fill(d.Client, now)
 	}
 }
 
@@ -149,12 +149,13 @@ func (b *broker) target(client uint16) *session {
 
 // send tenta entregar um MESSAGE sem bloquear. Assinante desconectado ou
 // com a fila cheia: a entrega continua AGUARDANDO, sem contar falha, e o
-// relógio tenta de novo. Chamar com b.mu travado.
-func (b *broker) send(d delivery.Delivery, now time.Time) {
+// relógio tenta de novo (devolve false). Chamar com b.mu travado; quem
+// escolhe o que enviar é fill (window.go).
+func (b *broker) send(d delivery.Delivery, now time.Time) bool {
 	s := b.target(d.Client)
 	p := b.pubs[d.Ref]
 	if s == nil || p == nil {
-		return
+		return false
 	}
 	msg := protocol.Frame{
 		Type:       protocol.TypeMessage,
@@ -163,9 +164,11 @@ func (b *broker) send(d delivery.Delivery, now time.Time) {
 		DeliveryID: d.ID,
 		Payload:    p.payload,
 	}
-	if s.trySend(msg) {
-		b.dm.MarkSent(d.ID, now) // começa a contar o prazo do ACK
+	if !s.trySend(msg) {
+		return false
 	}
+	b.dm.MarkSent(d.ID, now) // começa a contar o prazo do ACK
+	return true
 }
 
 // trySend enfileira um quadro sem bloquear; false se a fila estiver cheia.
@@ -199,6 +202,7 @@ func (b *broker) ack(s *session, id uint32) {
 	}
 	if ref, ok := b.dm.Ack(id, s.clientID); ok {
 		b.afterChange(ref)
+		b.fill(s.clientID, b.now()) // abriu uma vaga na janela
 	}
 }
 
@@ -260,8 +264,14 @@ func (b *broker) tick() {
 	online := func(c uint16) bool { return len(b.clients[c]) > 0 }
 	send, quarantined := b.dm.Tick(now, online)
 
+	// Entregas aguardando de assinantes conectados: cada um recebe o que
+	// couber na janela, pela regra de prioridade (window.go).
+	done := make(map[uint16]bool)
 	for _, d := range send {
-		b.send(d, now)
+		if !done[d.Client] {
+			done[d.Client] = true
+			b.fill(d.Client, now)
+		}
 	}
 	for _, d := range quarantined {
 		b.cfg.Logf("entrega %d (ref %d, cliente %d) em quarentena após %d falhas",

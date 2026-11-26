@@ -9,7 +9,7 @@
 // Ctrl+C encerra com limpeza: para de aceitar conexões, fecha as abertas e
 // fecha o log. O que foi confirmado continua no log.
 //
-// O log fica em disco, no wal do Felipe (adaptador em wal.go): um arquivo
+// O log fica em disco, no wal do Felipe (adaptador em broker/walstore): um arquivo
 // por época em DATA/log-<época>.wal. Reiniciar com a mesma pasta recupera
 // tópicos, assinaturas e entregas pendentes.
 package main
@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/GabriellCarvallho/mare-pubsub/broker/server"
+	"github.com/GabriellCarvallho/mare-pubsub/broker/walstore"
 )
 
 func main() {
@@ -87,7 +88,7 @@ func newConfig(o options, stdout io.Writer) server.Config {
 		Logf: func(format string, args ...any) {
 			fmt.Fprintf(stdout, time.Now().Format("15:04:05 ")+format+"\n", args...)
 		},
-		OpenLog: openWAL, // wal.go: log em disco (wal do Felipe)
+		OpenLog: walstore.Open, // log em disco (wal do Felipe)
 	}
 }
 
