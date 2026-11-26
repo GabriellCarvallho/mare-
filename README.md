@@ -37,15 +37,15 @@ Os resultados ficam em [`docs/metricas.md`](docs/metricas.md), gerado pelo `mare
 | Medida | Máquina da entrega (12 CPUs) |
 |---|---:|
 | PUBLISH de temperatura | 17 bytes (a mesma leitura em JSON: 135 bytes) |
-| Encode / Decode do PUBLISH | ~39 ns / ~27 ns (JSON: ~555 / ~730 ns) |
-| Vazão com log em disco | ~510 leituras/s |
-| Latência PUBLISH → PUBLISH_ACK, p50 / p95 | ~5,9 ms / ~10 ms |
-| Latência sensor → assinante, p50 / p95 | ~1,5 s / ~5,7 s |
-| Vazão com log em memória (sem fsync) | ~25.700 leituras/s |
-| Leitura crítica com consumidor lento e um sensor inundando | ~168 ms (sem a janela: ~2,4 s) |
+| Encode / Decode do PUBLISH | ~38 ns / ~25 ns (JSON: ~559 / ~737 ns) |
+| Vazão com log em disco | ~410 leituras/s |
+| Latência PUBLISH → PUBLISH_ACK, p50 / p95 | ~7,3 ms / ~12 ms |
+| Latência sensor → assinante, p50 / p95 | ~2,2 s / ~7,3 s |
+| Vazão com log em memória (sem fsync) | ~30.100 leituras/s |
+| Leitura crítica com consumidor lento e um sensor inundando | ~162 ms (sem a janela: ~2,4 s) |
 | Queda do principal → primeira leitura nova entregue | janela RECOVERING + 1 a 2 s (31 s com a janela padrão de 30 s) |
 
-Nessa máquina cada fsync leva ~6 ms: os sensores publicam mais rápido do que o disco grava também as confirmações de entrega, e as entregas se acumulam no broker durante o teste (por isso a latência até o assinante passa de 1 s, sem perda). Para comparação, **outra configuração** — linux/amd64, 2 CPUs, Go 1.24.7, fsync de ~1,2 ms, 4 execuções — deu 2.500 a 2.800 leituras/s e latência sensor → assinante de ~1,9 ms (p50) / ~4,1 ms (p95). O relatório de entrega traz as duas lado a lado.
+Nessa máquina cada fsync leva de 6 a 7 ms: os sensores publicam mais rápido do que o disco grava também as confirmações de entrega, e as entregas se acumulam no broker durante o teste (por isso a latência até o assinante passa de 2 s, sem perda nem reenvio). Para comparação, **outra configuração** — linux/amd64, 2 CPUs, Go 1.24.7, fsync de ~1,2 ms, 4 execuções — deu 2.500 a 2.800 leituras/s e latência sensor → assinante de ~1,9 ms (p50) / ~4,1 ms (p95). O relatório de entrega traz as duas lado a lado.
 
 ## Arquitetura
 
